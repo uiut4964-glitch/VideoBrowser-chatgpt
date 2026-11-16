@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.videobrowser"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     buildTypes {
@@ -35,4 +35,5 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.11.1")
     implementation("androidx.media3:media3-ui:1.11.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.11.1")
+    implementation("androidx.media3:media3-transformer:1.11.1")
 }

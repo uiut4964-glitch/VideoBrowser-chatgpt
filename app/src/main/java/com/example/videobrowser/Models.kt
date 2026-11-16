@@ -45,6 +45,7 @@ class Task(
     var segCount = 0
     @Volatile var expectedDurationSec = 0.0
     @Volatile var segmentDurations: DoubleArray? = null
+    @Volatile var segmentDiscontinuities: BooleanArray? = null
     @Volatile var hasHlsDiscontinuity = false
     var rangeOk = false
     var thumbUrl = ""
