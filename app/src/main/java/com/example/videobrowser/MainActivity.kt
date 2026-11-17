@@ -26,6 +26,7 @@ import android.view.ViewOutlineProvider
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -65,43 +66,154 @@ import kotlin.math.abs
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
-// يبحث عن الفيديو الذي يُشغَّل فعليًا (الأكبر ظهورًا على الشاشة) ويتجاهل المعاينات
-private const val SCAN_JS =
-    "(function(){var vs=document.querySelectorAll('video'),best=null,bs=-1,others=[];" +
-        "var vw=window.innerWidth,vh=window.innerHeight;" +
-        "for(var i=0;i<vs.length;i++){var v=vs[i];if(!v.__vid)v.__vid=Math.random().toString(36).slice(2);" +
-        "var s0=v.currentSrc||v.src||'';var r=v.getBoundingClientRect();" +
-        "var w=Math.max(0,Math.min(r.right,vw)-Math.max(r.left,0));" +
-        "var h=Math.max(0,Math.min(r.bottom,vh)-Math.max(r.top,0));var area=w*h;" +
-        "var playing=!v.paused&&!v.ended&&v.readyState>2;" +
-        "if(area<1||(!playing&&!(v.currentTime>1))){if(s0)others.push(s0);continue;}" +
-        "var sc=area*(playing?4:1)*(v.muted?1:2);" +
-        "if(sc>bs){if(best&&best.src)others.push(best.src);bs=sc;best={id:v.__vid,src:s0,poster:v.poster||''};}" +
-        "else if(s0)others.push(s0);}" +
-        "var og=document.querySelector('meta[property=\"og:image\"]');" +
-        "return JSON.stringify({n:vs.length,a:best,o:others,og:og?og.content:''});})()"
+// يرصد نقرة المستخدم على عنصر فيديو، ثم يتحقق من تقدم currentTime حتى إن مرّر المستخدم الصفحة لاحقًا.
+// السحب/التمرير وطلبات الشبكة وحدها لا تفعّل الزر العائم.
+private const val SCAN_JS = """
+(function(){
+  try {
+    if (!window.__vbGestureTrackerInstalled) {
+      window.__vbGestureTrackerInstalled = true;
+      document.addEventListener('click', function(e) {
+        try {
+          var path = e.composedPath ? e.composedPath() : [];
+          var v = null;
+          for (var i = 0; i < path.length; i++) {
+            var node = path[i];
+            if (node && node.tagName === 'VIDEO') { v = node; break; }
+          }
+          if (!v) {
+            var vs = document.querySelectorAll('video');
+            var bestArea = 0;
+            for (var j = 0; j < vs.length; j++) {
+              var candidate = vs[j];
+              var r = candidate.getBoundingClientRect();
+              if (e.clientX >= r.left && e.clientX <= r.right &&
+                  e.clientY >= r.top && e.clientY <= r.bottom) {
+                var area = Math.max(0, r.width) * Math.max(0, r.height);
+                if (area > bestArea) { bestArea = area; v = candidate; }
+              }
+            }
+          }
+          if (v) {
+            if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
+            v.__vbUserStarted = true;
+            v.__vbUserStartedAt = Date.now();
+            try {
+              if (window.VBVideoGesture && window.VBVideoGesture.onVideoGesture) {
+                window.VBVideoGesture.onVideoGesture(String(v.__vbId));
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }, true);
+    }
+
+    var vs = document.querySelectorAll('video');
+    var best = null;
+    var bestScore = -1;
+    var vw = window.innerWidth || 1;
+    var vh = window.innerHeight || 1;
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i];
+      if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
+      if (!v.__vbPauseHooks) {
+        v.__vbPauseHooks = true;
+        var stopUserPlayback = function() {
+          this.__vbUserStarted = false;
+          try {
+            if (window.VBVideoGesture && window.VBVideoGesture.onVideoStopped) {
+              window.VBVideoGesture.onVideoStopped(String(this.__vbId || ''));
+            }
+          } catch (_) {}
+        };
+        v.addEventListener('pause', stopUserPlayback, true);
+        v.addEventListener('ended', stopUserPlayback, true);
+      }
+      var src = v.currentSrc || v.src || '';
+      var r = v.getBoundingClientRect();
+      var w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+      var h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+      var area = w * h;
+      var playing = !v.paused && !v.ended && v.readyState >= 2;
+      var ct = Number(v.currentTime || 0);
+      var previous = v.__vbLastTime;
+      var previousAt = v.__vbLastAt || 0;
+      var advancing = previous !== undefined && (now - previousAt) >= 350 && ct > previous + 0.04;
+      v.__vbLastTime = ct;
+      v.__vbLastAt = now;
+      var userStarted = v.__vbUserStarted === true;
+      if (!playing || !advancing || !userStarted) continue;
+      // الأحدث تفاعلًا هو الفيديو النشط حتى إذا مرّر المستخدم الصفحة بعيدًا عنه.
+      var score = Number(v.__vbUserStartedAt || 0) + Math.min(area, 100000) / 1000000;
+      if (score > bestScore) {
+        bestScore = score;
+        var sourceList = [];
+        if (src) sourceList.push(src);
+        if (v.src && sourceList.indexOf(v.src) < 0) sourceList.push(v.src);
+        var sourceNodes = v.querySelectorAll('source');
+        for (var si = 0; si < sourceNodes.length; si++) {
+          var sourceUrl = sourceNodes[si].src || sourceNodes[si].getAttribute('src') || '';
+          if (sourceUrl && sourceList.indexOf(sourceUrl) < 0) sourceList.push(sourceUrl);
+        }
+        best = {
+          id: String(v.__vbId),
+          src: src,
+          sources: sourceList,
+          poster: v.poster || '',
+          currentTime: ct,
+          duration: Number(v.duration || 0)
+        };
+      }
+    }
+    return JSON.stringify({a: best});
+  } catch (_) {
+    return JSON.stringify({a: null});
+  }
+})();
+"""
 
 private const val DESKTOP_UA =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-private val MEDIA_REGEX = Regex(
-    "\\.(mp4|m4v|webm|mkv|mov|flv|3gp|m3u8|mp3|m4a|aac|ogg|wav)(\\?|#|$)",
-    RegexOption.IGNORE_CASE
-)
-
 class MainActivity : AppCompatActivity() {
+
+    private data class SniffedMedia(
+        val url: String,
+        val requestedAt: Long,
+        val videoId: String
+    )
 
     private class Tab(val web: WebView) {
         var title = "علامة تبويب جديدة"
         var url = ""
         var pending = false
         val media = LinkedHashMap<String, MediaItem>()
-        val sniffed = LinkedHashMap<String, Long>()
+        val sniffed = LinkedHashMap<String, SniffedMedia>()
         var sawBlob = false
-        var activeId: String? = null
-        var playStart = 0L
+        @Volatile var activePlayback = false
+        @Volatile var activeId: String? = null
+        @Volatile var userGestureVideoId: String? = null
+        @Volatile var userGestureAt = 0L
         var poster = ""
         var lastForced = ""
+    }
+
+    class VideoGestureBridge(
+        private val onGesture: (String) -> Unit,
+        private val onStopped: (String) -> Unit
+    ) {
+        @JavascriptInterface
+        fun onVideoGesture(videoId: String?) {
+            val id = videoId?.take(100)?.trim().orEmpty()
+            if (id.isNotEmpty()) onGesture(id)
+        }
+
+        @JavascriptInterface
+        fun onVideoStopped(videoId: String?) {
+            val id = videoId?.take(100)?.trim().orEmpty()
+            if (id.isNotEmpty()) onStopped(id)
+        }
     }
 
     private val tabs = ArrayList<Tab>()
@@ -111,7 +223,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var fab: FrameLayout
     private lateinit var fabIcon: ImageView
-    private lateinit var badge: TextView
     private lateinit var tabBtn: TextView
     private val io = Executors.newCachedThreadPool()
     private val ui = Handler(Looper.getMainLooper())
@@ -216,6 +327,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         ui.removeCallbacks(scanLoop)
+        cur?.let {
+            it.activePlayback = false
+            it.media.clear()
+            updateFab()
+        }
         saveTabs()
         super.onPause()
     }
@@ -346,15 +462,6 @@ class MainActivity : AppCompatActivity() {
             elevation = dp(6).toFloat()
         }
         fab.addView(fabIcon, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
-        badge = TextView(this).apply {
-            textSize = 11f
-            gravity = Gravity.CENTER
-            setTextColor(0xFFE53935.toInt())
-            background = circle(Color.WHITE)
-            elevation = dp(8).toFloat()
-            visibility = View.GONE
-        }
-        fab.addView(badge, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.TOP or Gravity.END))
         content.addView(fab, FrameLayout.LayoutParams(dp(62), dp(62), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(dp(14), dp(14), dp(14), dp(24))
         })
@@ -382,10 +489,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateFab() {
-        val n = cur?.media?.size ?: 0
-        (fabIcon.background as GradientDrawable).setColor(if (n > 0) 0xFFE53935.toInt() else 0xFF78909C.toInt())
-        badge.visibility = if (n > 0) View.VISIBLE else View.GONE
-        badge.text = n.toString()
+        // لا عدادات أو شارات: الأحمر حصريًا عند رصد تشغيل فعلي بدأه المستخدم.
+        val active = cur?.activePlayback == true
+        (fabIcon.background as GradientDrawable).setColor(
+            if (active) 0xFFE53935.toInt() else 0xFF78909C.toInt()
+        )
+        fabIcon.alpha = if (active) 1.0f else 0.88f
     }
 
     // ---------------------------------------------------------------- التبويبات
@@ -393,8 +502,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun newTab(url: String?, load: Boolean = true, title: String = "") {
         val w = WebView(this)
-        setupWebView(w)
         val t = Tab(w)
+        setupWebView(w, t)
         tabs.add(t)
         if (load) {
             selectTab(t)
@@ -408,7 +517,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectTab(t: Tab) {
-        cur?.let { content.removeView(it.web); it.web.onPause() }
+        cur?.let {
+            it.activePlayback = false
+            it.media.clear()
+            content.removeView(it.web)
+            it.web.onPause()
+        }
         cur = t
         t.web.onResume()
         content.addView(t.web, 0, FrameLayout.LayoutParams(MATCH, MATCH))
@@ -425,6 +539,8 @@ class MainActivity : AppCompatActivity() {
     private fun closeTab(t: Tab) {
         val i = tabs.indexOf(t)
         tabs.remove(t)
+        t.activePlayback = false
+        t.media.clear()
         content.removeView(t.web)
         t.web.destroy()
         if (cur === t) cur = null
@@ -463,7 +579,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView(w: WebView) {
+    private fun setupWebView(w: WebView, tab: Tab) {
         val s = w.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -476,6 +592,24 @@ class MainActivity : AppCompatActivity() {
         s.javaScriptCanOpenWindowsAutomatically = false
         applyUa(w)
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        w.addJavascriptInterface(VideoGestureBridge(
+            onGesture = { id ->
+                tab.userGestureVideoId = id
+                tab.userGestureAt = System.currentTimeMillis()
+            },
+            onStopped = { id ->
+                if (tab.userGestureVideoId == id) {
+                    tab.userGestureVideoId = null
+                    tab.userGestureAt = 0L
+                    tab.activePlayback = false
+                    tab.activeId = null
+                    ui.post {
+                        tab.media.clear()
+                        if (cur === tab) updateFab()
+                    }
+                }
+            }
+        ), "VBVideoGesture")
 
         w.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
@@ -498,7 +632,10 @@ class MainActivity : AppCompatActivity() {
                 t.url = url
                 t.media.clear()
                 t.sniffed.clear()
+                t.activePlayback = false
                 t.activeId = null
+                t.userGestureVideoId = null
+                t.userGestureAt = 0L
                 t.sawBlob = false
                 t.poster = ""
                 if (t === cur) { urlBar.setText(url); updateFab() }
@@ -514,8 +651,10 @@ class MainActivity : AppCompatActivity() {
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
-                if (MEDIA_REGEX.containsMatchIn(u) || u.contains("videoplayback")) {
-                    ui.post { tabOf(v)?.let { rec(it, u) } }
+                // نسجل مصادر الفيديو المحتملة فقط، وبعد نقرة المستخدم على عنصر فيديو.
+                // لا نسجل الصور المصغرة أو المعاينات أو مقاطع HLS/DASH الجزئية.
+                if (!r.isForMainFrame && isCandidateMediaRequest(u)) {
+                    ui.post { rec(tab, u) }
                 }
                 return null
             }
@@ -575,15 +714,73 @@ class MainActivity : AppCompatActivity() {
         Store.putEntries(this, "history", l)
     }
 
-    // ---------------------------------------------------------------- كشف الفيديو الذي يُشغَّل فعليًا
+    // ---------------------------------------------------------------- كشف الفيديو الذي بدأه المستخدم ويعمل فعليًا
+    private fun isExcludedMediaUrl(raw: String): Boolean {
+        val decoded = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+        val uri = Uri.parse(decoded)
+        val pathAndQuery = (uri.path.orEmpty() + "?" + uri.query.orEmpty()).lowercase()
+        val unwantedRoles = listOf(
+            "preview", "previews", "thumbnail", "thumb", "thumbs", "poster",
+            "trailer", "trailers", "teaser", "teasers", "storyboard", "sprite"
+        )
+        val rolePattern = Regex("(^|[/_.?&=\\-])(" + unwantedRoles.joinToString("|") { Regex.escape(it) } + ")([/_.?&=\\-]|$)")
+        return rolePattern.containsMatchIn(pathAndQuery)
+    }
+
+    private fun isStreamingChunkRequest(raw: String): Boolean {
+        val uri = Uri.parse(raw)
+        val path = uri.path.orEmpty().lowercase()
+        val name = path.substringAfterLast('/')
+        if (path.endsWith(".ts") || path.endsWith(".m4s") || path.endsWith(".cmfv") || path.endsWith(".cmfa")) return true
+        val chunkQueryNames = setOf("sq", "range", "chunk", "chunks", "segment", "segments", "fragment", "part")
+        if (uri.queryParameterNames.any { it.lowercase() in chunkQueryNames }) return true
+        val chunkName = Regex("(^|[-_.])(chunk|chunks|chunked|segment|segments|fragment|fragments|part|seg)([-_.]?[0-9]*)([-_.]|$)")
+        return chunkName.containsMatchIn(name)
+    }
+
+    private fun isHlsUrl(raw: String): Boolean {
+        val path = Uri.parse(raw).path.orEmpty().lowercase()
+        return path.endsWith(".m3u8")
+    }
+
+    private fun isCandidateMediaRequest(raw: String): Boolean {
+        if (!raw.startsWith("http://", true) && !raw.startsWith("https://", true)) return false
+        if (isExcludedMediaUrl(raw)) return false
+        val uri = Uri.parse(raw)
+        val path = uri.path.orEmpty().lowercase()
+        if (path.endsWith(".m3u8")) return true
+        if (isStreamingChunkRequest(raw)) return false
+        val directVideo = listOf(".mp4", ".m4v", ".webm", ".mkv", ".mov", ".flv", ".3gp")
+            .any { path.endsWith(it) }
+        if (directVideo) return true
+        if (path.contains("/videoplayback")) {
+            // استبعد طلبات المقاطع المتتابعة/المجزأة؛ اقبل رابط التشغيل الكامل فقط.
+            return uri.getQueryParameter("sq") == null && uri.getQueryParameter("range") == null
+        }
+        return false
+    }
+
     private fun rec(t: Tab, url: String) {
-        if (t.sniffed.containsKey(url)) return
-        t.sniffed[url] = System.currentTimeMillis()
-        if (t.sniffed.size > 80) t.sniffed.remove(t.sniffed.keys.first())
+        if (!isCandidateMediaRequest(url)) return
+        val now = System.currentTimeMillis()
+        val gestureId = t.userGestureVideoId ?: return
+        val gestureAge = now - t.userGestureAt
+        // الطلبات قد تبدأ مباشرة بعد نقرة التشغيل وقبل أول حدث playing.
+        // وبعد بدء التشغيل نسمح بطلبات الجودة المرتبطة بمعرّف عنصر الفيديو نفسه.
+        val sameActiveVideo = t.activePlayback && t.activeId == gestureId
+        if (!sameActiveVideo && gestureAge !in 0L..20_000L) return
+        t.sniffed[url] = SniffedMedia(url, now, gestureId)
+        while (t.sniffed.size > 40) {
+            val oldest = t.sniffed.keys.firstOrNull() ?: break
+            t.sniffed.remove(oldest)
+        }
     }
 
     private fun addTo(t: Tab, url: String) {
-        t.media[url] = MediaItem(url, if (url.contains(".m3u8", true)) "hls" else "direct")
+        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return
+        if (isExcludedMediaUrl(url)) return
+        if (!isHlsUrl(url) && isStreamingChunkRequest(url)) return
+        t.media[url] = MediaItem(url, if (isHlsUrl(url)) "hls" else "direct")
     }
 
     private fun scan(t: Tab) {
@@ -594,48 +791,75 @@ class MainActivity : AppCompatActivity() {
                     val s = JSONTokener(r).nextValue() as? String
                     if (s != null) onScan(t, JSONObject(s))
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
             }
         }
     }
 
     private fun onScan(t: Tab, o: JSONObject) {
-        val n = o.optInt("n")
         val a = o.optJSONObject("a")
-        val others = HashSet<String>()
-        val oa = o.optJSONArray("o")
-        if (oa != null) for (i in 0 until oa.length()) others.add(oa.getString(i))
-
         if (a == null) {
+            t.activePlayback = false
             t.activeId = null
             t.media.clear()
-            if (n == 0) {
-                // لا يوجد عنصر فيديو في الصفحة نفسها (قد يكون داخل iframe): نعرض آخر ما التُقط حديثًا
-                val now = System.currentTimeMillis()
-                for ((u, ts) in t.sniffed) if (now - ts < 90000) addTo(t, u)
-            }
+            t.sawBlob = false
             updateFab()
             return
         }
-        val id = a.getString("id")
+
+        val id = a.optString("id")
+        val now = System.currentTimeMillis()
+        // يحتفظ عنصر الفيديو بحالة userStarted حتى pause/ended؛ لا تنتهي الصلاحية
+        // بعد مدة طويلة إذا استمر الفيديو نفسه في التشغيل.
+        val gestureMatches = t.userGestureVideoId == id
+        if (id.isBlank() || !gestureMatches) {
+            t.activePlayback = false
+            t.activeId = null
+            t.media.clear()
+            updateFab()
+            return
+        }
+
         if (id != t.activeId) {
             t.activeId = id
-            t.playStart = System.currentTimeMillis()
+            t.media.clear()
         }
+        t.activePlayback = true
         val src = a.optString("src")
-        t.poster = a.optString("poster").ifEmpty { o.optString("og") }
+        t.poster = a.optString("poster")
+        t.sawBlob = src.startsWith("blob:", true)
         t.media.clear()
-        if (src.startsWith("http")) {
-            addTo(t, src)
+
+        // استخدم مصادر عنصر الفيديو نفسه أولًا، بما فيها عناصر <source> البديلة.
+        val directSources = LinkedHashSet<String>()
+        val sourceArray = a.optJSONArray("sources")
+        if (sourceArray != null) {
+            for (i in 0 until sourceArray.length()) {
+                val sourceUrl = sourceArray.optString(i)
+                if (sourceUrl.startsWith("http://", true) || sourceUrl.startsWith("https://", true)) {
+                    directSources.add(sourceUrl)
+                }
+            }
+        }
+        if (directSources.isEmpty() &&
+            (src.startsWith("http://", true) || src.startsWith("https://", true))) {
+            directSources.add(src)
+        }
+
+        if (directSources.isNotEmpty()) {
+            directSources.forEach { addTo(t, it) }
         } else {
-            if (src.startsWith("blob:")) t.sawBlob = true
-            val cand = t.sniffed.filter { !others.contains(it.key) }
-            val recent = cand.filter { it.value >= t.playStart - 5000 }
-            val pick = LinkedHashMap<String, Long>()
-            pick.putAll(if (recent.isNotEmpty()) recent else cand)
-            // القائمة الرئيسية لبث m3u8 تُطلب عادةً قبل بدء التشغيل، فنُبقيها دائمًا ضمن المرشحين
-            for ((u, ts) in cand) if (u.contains(".m3u8", true)) pick[u] = ts
-            for (u in pick.keys) addTo(t, u)
+            val captured = t.sniffed.values
+                .filter { it.videoId == id && now - it.requestedAt in 0L..120_000L }
+                .sortedByDescending { it.requestedAt }
+            // في MSE/Blob نفضّل قوائم HLS المرتبطة بنقرة الفيديو نفسه،
+            // ثم روابط ملفات الفيديو الكاملة فقط، ولا نعرض مقاطع النقل الخام.
+            val playlists = captured.filter { isHlsUrl(it.url) }
+            if (playlists.isNotEmpty()) {
+                playlists.take(6).forEach { addTo(t, it.url) }
+            } else {
+                captured.map { it.url }.distinct().take(8).forEach { addTo(t, it) }
+            }
         }
         updateFab()
     }
@@ -648,7 +872,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val u = URL(t.url)
                 m["Origin"] = u.protocol + "://" + u.host
-            } catch (e: Exception) {
+            } catch (_: Exception) {
             }
         }
         return m
@@ -656,30 +880,60 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFabClick() {
         val t = cur ?: return
+        if (!t.activePlayback) {
+            toast("شغّل الفيديو بالضغط عليه أولًا؛ سيصبح الزر أحمر عند بدء التشغيل")
+            return
+        }
         if (t.media.isEmpty()) {
             toast(
-                if (t.sawBlob) "هذا الموقع يستخدم بثًا محميًا لا يمكن تحميله مباشرة"
-                else "لم أجد فيديو قيد التشغيل. شغّل الفيديو الذي تريده أولًا ثم اضغط الزر"
+                if (t.sawBlob) "مصدر الفيديو يستخدم Blob/MSE ولم يتم العثور على قائمة أو ملف فيديو قابل للتنزيل"
+                else "لم يتم التعرف على رابط تنزيل مباشر لهذا الفيديو"
             )
             return
         }
-        toast("جارٍ جلب الصيغ المتاحة...")
+        val activeId = t.activeId
+        toast("جارٍ جلب جودات الفيديو الجاري تشغيله...")
         val items = t.media.values.toList()
         val headers = headersFor(t)
         val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
         io.execute {
-            val list = ArrayList<Format>()
+            val resolved = ArrayList<List<Format>>()
             for (item in items) {
-                try { list.addAll(Formats.resolve(item, headers)) } catch (e: Exception) {}
+                try {
+                    val formats = Formats.resolve(item, headers)
+                    if (formats.isNotEmpty()) resolved.add(formats)
+                } catch (_: Exception) {
+                }
             }
-            val clean = list.filter { f -> f.fromMaster || list.none { it.fromMaster && it.url == f.url } }
-                .distinctBy { it.url }
+            // عند وجود قائمة HLS Master نستخدم جوداتها بدل جمع روابط المقاطع/الطلبات الخام.
+            val masterFormats = resolved
+                .filter { group -> group.any { it.fromMaster && !it.isAudio } }
+                .maxByOrNull { group -> group.count { it.fromMaster && !it.isAudio } }
+            val sourceFormats = masterFormats ?: resolved.flatten()
+            val clean = sourceFormats
+                .filter { f ->
+                    !f.isAudio && !Formats.isAudio(f.ext) &&
+                        (f.kind == "hls" || Util.kindOf("x." + f.ext) == "video")
+                }
+                .distinctBy { f -> f.url }
+                .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
             ui.post {
-                if (isFinishing) return@post
-                if (clean.isEmpty()) toast("تعذر جلب معلومات الفيديو") else showFormatSheet(clean, headers, title, poster)
+                if (isFinishing || isDestroyed) return@post
+                // لا نعرض نتائج مصدر قديم إذا انتقل المستخدم إلى فيديو أو تبويب آخر أثناء التحليل.
+                if (cur !== t || !t.activePlayback || t.activeId != activeId) return@post
+                if (clean.isEmpty()) {
+                    toast("لم أتمكن من استخراج جودات قابلة للتنزيل لهذا الفيديو")
+                } else {
+                    showFormatSheet(clean, headers, title, poster)
+                }
             }
         }
+    }
+
+    private fun qualityRank(label: String): Int {
+        val match = Regex("(\\d{3,4})\\s*[pP]").find(label)
+        return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
     }
 
     // ---------------------------------------------------------------- شاشة اختيار الجودة
