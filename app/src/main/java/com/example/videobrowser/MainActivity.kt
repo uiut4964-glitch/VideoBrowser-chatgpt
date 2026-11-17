@@ -71,108 +71,335 @@ private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 private const val SCAN_JS = """
 (function(){
   try {
+    var isHttp = function(u){ return /^https?:\/\//i.test(String(u || '')); };
+    var absUrl = function(u){
+      try { return new URL(String(u || ''), document.baseURI).href; }
+      catch (_) { return String(u || ''); }
+    };
+    var isAdUrl = function(raw){
+      var s = String(raw || '').toLowerCase();
+      try { s = decodeURIComponent(s); } catch (_) {}
+      if (/(doubleclick|googlesyndication|googleadservices|adservice|adserver|imasdk|vasttag|spotx|freewheel|adnxs|adsystem|advertising)/i.test(s)) return true;
+      if (/[?&](adtag|adurl|ad_type|adtype|vast|vmap|preroll|midroll|postroll)=/i.test(s)) return true;
+      return /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i.test(s);
+    };
+    var isChunkUrl = function(raw){
+      var u = absUrl(raw);
+      var p = '';
+      try { p = new URL(u).pathname.toLowerCase(); } catch (_) {}
+      var n = p.substring(p.lastIndexOf('/') + 1);
+      return /\.(ts|m4s|cmfv|cmfa|m4v-frag)$/i.test(p) ||
+        /(?:^|[-_.])(chunk|chunks|segment|segments|fragment|fragments|part|seg)(?:[-_.]?[0-9]*)(?:[-_.]|$)/i.test(n);
+    };
+    var isMediaUrl = function(raw){
+      var u = absUrl(raw);
+      var p = '';
+      try { p = new URL(u).pathname.toLowerCase(); } catch (_) {}
+      return /\.(m3u8|mp4|m4v|webm|mkv|mov|flv|3gp)(?:$)/i.test(p) || /\/videoplayback$/i.test(p);
+    };
+    var hasAdMarker = function(el){
+      var n = el;
+      for (var depth = 0; n && depth < 7; depth++, n = n.parentElement) {
+        var id = n.id || '';
+        var cls = typeof n.className === 'string' ? n.className : '';
+        var role = n.getAttribute ? (n.getAttribute('data-ad') || '') : '';
+        var flag = n.getAttribute ? (n.getAttribute('data-ad-playing') || '') : '';
+        var sig = id + ' ' + cls + ' ' + role + ' ' + flag;
+        if (/(^|[\s_-])(ima-ad-container|video-ads|ad-container|ad-player|ad-playing|advertisement|advertising|jw-ad|vjs-ad-playing|ad-showing|preroll|midroll|postroll)(?=$|[\s_-])/i.test(sig)) return true;
+        if (role && role !== 'false' && role !== '0' && role !== 'none') return true;
+        if (flag === 'true' || flag === '1') return true;
+      }
+      return false;
+    };
+    var hasVisibleAdOverlay = function(v){
+      try {
+        var selectors = '.ima-ad-container,.video-ads,.jw-ad,.jw-flag-ads,.vjs-ad-playing,.ad-showing,.shaka-ad-container,[class*="ad-container" i],[id*="ad-container" i],[class*="ad-playing" i],[data-ad-playing="true"],[aria-label*="advertisement" i]';
+        var layers = document.querySelectorAll(selectors);
+        var vr = v.getBoundingClientRect();
+        for (var i = 0; i < Math.min(layers.length, 20); i++) {
+          var layer = layers[i];
+          if (!visible(layer)) continue;
+          var lr = layer.getBoundingClientRect();
+          var iw = Math.max(0, Math.min(vr.right, lr.right) - Math.max(vr.left, lr.left));
+          var ih = Math.max(0, Math.min(vr.bottom, lr.bottom) - Math.max(vr.top, lr.top));
+          var overlap = iw * ih;
+          var videoArea = Math.max(1, vr.width * vr.height);
+          if (overlap / videoArea > 0.18) return true;
+        }
+      } catch (_) {}
+      return false;
+    };
+    var visible = function(el){
+      if (!el || !el.getBoundingClientRect) return false;
+      var cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || 1) === 0) return false;
+      var r = el.getBoundingClientRect();
+      return r.width >= 70 && r.height >= 45;
+    };
+    var parsePlayerConfig = function(raw, add, depth){
+      if (raw === null || raw === undefined || depth > 8) return;
+      if (typeof raw === 'string') {
+        var value = raw.trim();
+        if (!value) return;
+        if ((value.charAt(0) === '{' || value.charAt(0) === '[') && value.length < 500000) {
+          try { parsePlayerConfig(JSON.parse(value), add, depth + 1); return; } catch (_) {}
+        }
+        if (isMediaUrl(value)) add(value);
+        return;
+      }
+      if (Array.isArray(raw)) {
+        for (var i = 0; i < Math.min(raw.length, 80); i++) parsePlayerConfig(raw[i], add, depth + 1);
+        return;
+      }
+      if (typeof raw !== 'object') return;
+      var badKey = /(^|[_-])(ad|ads|advert|advertisement|vast|vmap|preroll|midroll|postroll|promo|preview|thumb|poster|trailer|teaser|sponsor)([_-]|$)|^(ad|ads|advert|vast|vmap|preroll|midroll|postroll|promo|preview|thumb|poster|trailer|teaser|sponsor)/i;
+      var sourceKey = /(file|src|url|hls|m3u8|manifest|source|playlist|contenturl|stream|video|mp4|webm)/i;
+      var keys = Object.keys(raw);
+      for (var k = 0; k < Math.min(keys.length, 120); k++) {
+        var key = keys[k];
+        if (badKey.test(key)) continue;
+        var value = raw[key];
+        if (typeof value === 'string' && sourceKey.test(key)) parsePlayerConfig(value, add, depth + 1);
+        else if (value && typeof value === 'object') parsePlayerConfig(value, add, depth + 1);
+      }
+    };
+    var collectSources = function(v){
+      var out = [];
+      var seen = Object.create(null);
+      var add = function(raw){
+        var u = absUrl(raw);
+        if (!isHttp(u) || isAdUrl(u) || isChunkUrl(u) || !isMediaUrl(u) || seen[u]) return;
+        seen[u] = true;
+        out.push(u);
+      };
+      // 1) إعدادات المحتوى المسبقة على عنصر الفيديو والحاويات القريبة.
+      var n = v;
+      var playerRoot = v.parentElement || document;
+      for (var depth = 0; n && depth < 7; depth++, n = n.parentElement) {
+        if (!n.getAttribute) continue;
+        var attrs = [
+          'data-src','data-file','data-video','data-video-url','data-content-url',
+          'data-hls','data-m3u8','data-manifest','data-stream-url','data-file-url',
+          'data-player-config','data-setup','data-config','data-options'
+        ];
+        for (var a = 0; a < attrs.length; a++) {
+          var attrValue = n.getAttribute(attrs[a]);
+          if (!attrValue) continue;
+          if (attrs[a].indexOf('config') >= 0 || attrs[a] === 'data-setup' || attrs[a] === 'data-options') {
+            parsePlayerConfig(attrValue, add, 0);
+          } else add(attrValue);
+        }
+        var cls = typeof n.className === 'string' ? n.className : '';
+        var marker = (n.id || '') + ' ' + cls;
+        if (depth > 0 && /(player|video|media|watch|stream|jwplayer|video-js|plyr)/i.test(marker)) {
+          playerRoot = n;
+          break;
+        }
+      }
+      // 2) مصادر source داخل عنصر الفيديو أو حاوية المشغل فقط، مع تجاهل الصوت.
+      var children = v.querySelectorAll ? v.querySelectorAll('source[src],source[data-src]') : [];
+      for (var i = 0; i < Math.min(children.length, 12); i++) {
+        var childType = (children[i].getAttribute('type') || '').toLowerCase();
+        if (!childType || childType.indexOf('video/') === 0 || childType.indexOf('application/vnd.apple.mpegurl') === 0) {
+          add(children[i].getAttribute('src') || children[i].getAttribute('data-src'));
+        }
+      }
+      // 3) إعداد JSON/VideoObject داخل نطاق المشغل، وليس جميع روابط الصفحة عشوائيًا.
+      var scripts = playerRoot && playerRoot.querySelectorAll ? playerRoot.querySelectorAll('script[type="application/json"],script[type="application/ld+json"],script[id*="player" i],script[id*="video" i],[data-player-config]') : [];
+      for (var j = 0; j < Math.min(scripts.length, 12); j++) {
+        var text = scripts[j].textContent || scripts[j].getAttribute('data-player-config') || '';
+        if (text.length < 500000) parsePlayerConfig(text, add, 0);
+      }
+      // 4) بيانات VideoObject وOpen Graph على الصفحة، وهي مفيدة قبل بدء الإعلان.
+      var ld = document.querySelectorAll('script[type="application/ld+json"]');
+      for (var x = 0; x < Math.min(ld.length, 8); x++) {
+        var ldText = ld[x].textContent || '';
+        if (!/VideoObject/i.test(ldText) || ldText.length > 500000) continue;
+        parsePlayerConfig(ldText, add, 0);
+      }
+      var metas = document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"]');
+      for (var m = 0; m < Math.min(metas.length, 4); m++) add(metas[m].content);
+      // currentSrc/src قد يتحولان مؤقتًا إلى ملف الإعلان؛ لا نضيفهما أثناء وضع الإعلان.
+      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(v.currentSrc || v.getAttribute('src') || '');
+      if (!adNow) {
+        add(v.getAttribute('src'));
+        add(v.currentSrc);
+      }
+      return out.slice(0, 24);
+    };
+    var makeId = function(v){
+      if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
+      return String(v.__vbId);
+    };
+    var emit = function(v, eventName){
+      try {
+        var id = makeId(v);
+        var src = absUrl(v.currentSrc || v.getAttribute('src') || '');
+        var sources = collectSources(v);
+        var key = src + '||' + sources.join('||');
+        var duration = Number(v.duration || 0);
+        if (key !== v.__vbSourceKey) {
+          v.__vbSourceKey = key;
+          v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
+        }
+        if (duration > 0 && v.__vbLastDuration > 0 && Math.abs(duration - v.__vbLastDuration) > 2) {
+          v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
+        }
+        if (duration > 0) v.__vbLastDuration = duration;
+        if (eventName === 'ended') {
+          v.__vbCycle = Number(v.__vbCycle || 0) + 1;
+          v.__vbEndedSincePlay = true;
+        } else if (eventName === 'playing' && v.__vbEndedSincePlay) {
+          v.__vbEndedSincePlay = false;
+          v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
+        }
+        var adContainer = hasAdMarker(v) || hasVisibleAdOverlay(v);
+        var ad = isAdUrl(src) || adContainer;
+        var wasAdState = v.__vbAdState;
+        if (wasAdState === true && !ad) {
+          // إعلان ما قبل التشغيل انتهى وبدأ المحتوى على عنصر الفيديو نفسه.
+          v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
+          v.__vbCycle = Number(v.__vbCycle || 0) + 1;
+        }
+        v.__vbAdState = ad;
+        if (window.VBVideoGesture && window.VBVideoGesture.onVideoEvent) {
+          window.VBVideoGesture.onVideoEvent(
+            id, key, !!ad, String(eventName || 'scan'), duration,
+            Number(v.__vbSourceEpoch || 0), Number(v.__vbCycle || 0),
+            JSON.stringify(sources), !!adContainer
+          );
+        }
+      } catch (_) {}
+    };
+    var videos = Array.prototype.slice.call(document.querySelectorAll('video'));
     if (!window.__vbGestureTrackerInstalled) {
       window.__vbGestureTrackerInstalled = true;
-      document.addEventListener('click', function(e) {
+      document.addEventListener('click', function(e){
         try {
           var path = e.composedPath ? e.composedPath() : [];
-          var v = null;
+          var target = null;
           for (var i = 0; i < path.length; i++) {
-            var node = path[i];
-            if (node && node.tagName === 'VIDEO') { v = node; break; }
+            if (path[i] && path[i].tagName === 'VIDEO') { target = path[i]; break; }
           }
-          if (!v) {
-            var vs = document.querySelectorAll('video');
-            var bestArea = 0;
-            for (var j = 0; j < vs.length; j++) {
-              var candidate = vs[j];
-              var r = candidate.getBoundingClientRect();
-              if (e.clientX >= r.left && e.clientX <= r.right &&
-                  e.clientY >= r.top && e.clientY <= r.bottom) {
-                var area = Math.max(0, r.width) * Math.max(0, r.height);
-                if (area > bestArea) { bestArea = area; v = candidate; }
+          if (!target) {
+            var best = -1;
+            var currentVideos = document.querySelectorAll('video');
+            for (var j = 0; j < currentVideos.length; j++) {
+              var r = currentVideos[j].getBoundingClientRect();
+              if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+                var a = Math.max(0, r.width) * Math.max(0, r.height);
+                if (a > best) { best = a; target = currentVideos[j]; }
               }
             }
           }
-          if (v) {
-            if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
-            v.__vbUserStarted = true;
-            v.__vbUserStartedAt = Date.now();
-            try {
+          if (!target) return;
+          var tr = target.getBoundingClientRect();
+          var currentVideosForOverlap = document.querySelectorAll('video');
+          for (var k = 0; k < currentVideosForOverlap.length; k++) {
+            var v = currentVideosForOverlap[k];
+            var r2 = v.getBoundingClientRect();
+            var iw = Math.max(0, Math.min(tr.right, r2.right) - Math.max(tr.left, r2.left));
+            var ih = Math.max(0, Math.min(tr.bottom, r2.bottom) - Math.max(tr.top, r2.top));
+            var overlap = iw * ih;
+            var area = Math.max(1, Math.min(tr.width * tr.height, r2.width * r2.height));
+            if (v === target || overlap / area > 0.55) {
+              var id = makeId(v);
+              v.__vbUserInitiated = true;
+              v.__vbUserInitiatedAt = Date.now();
               if (window.VBVideoGesture && window.VBVideoGesture.onVideoGesture) {
-                window.VBVideoGesture.onVideoGesture(String(v.__vbId));
+                window.VBVideoGesture.onVideoGesture(id);
               }
-            } catch (_) {}
+            }
           }
         } catch (_) {}
       }, true);
     }
-
-    var vs = document.querySelectorAll('video');
-    var best = null;
+    var bestVideo = null;
     var bestScore = -1;
-    var vw = window.innerWidth || 1;
-    var vh = window.innerHeight || 1;
-    var now = (window.performance && performance.now) ? performance.now() : Date.now();
-    for (var i = 0; i < vs.length; i++) {
-      var v = vs[i];
-      if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
-      if (!v.__vbPauseHooks) {
-        v.__vbPauseHooks = true;
-        var stopUserPlayback = function() {
-          this.__vbUserStarted = false;
-          try {
-            if (window.VBVideoGesture && window.VBVideoGesture.onVideoStopped) {
-              window.VBVideoGesture.onVideoStopped(String(this.__vbId || ''));
-            }
-          } catch (_) {}
-        };
-        v.addEventListener('pause', stopUserPlayback, true);
-        v.addEventListener('ended', stopUserPlayback, true);
+    var bestAdVideo = null;
+    var bestAdScore = -1;
+    var now = Date.now();
+    var active = null;
+    for (var i = 0; i < videos.length; i++) {
+      var v = videos[i];
+      makeId(v);
+      if (!v.__vbHooks) {
+        v.__vbHooks = true;
+        ['loadstart','emptied','loadedmetadata','durationchange','playing','pause','ended','seeking','seeked'].forEach(function(name){
+          v.addEventListener(name, function(){
+            if (name === 'seeking') v.__vbWasSeeking = true;
+            if (name === 'seeked') v.__vbWasSeeking = false;
+            emit(v, name);
+          }, true);
+        });
       }
-      var src = v.currentSrc || v.src || '';
+      if (!visible(v)) continue;
       var r = v.getBoundingClientRect();
-      var w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
-      var h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
-      var area = w * h;
-      var playing = !v.paused && !v.ended && v.readyState >= 2;
+      var area = Math.max(0, r.width) * Math.max(0, r.height);
+      if (area < 9000) continue;
+      var src = absUrl(v.currentSrc || v.getAttribute('src') || '');
+      var ad = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v);
+      var sources = collectSources(v);
+      var center = Math.max(0, 1 - Math.abs((r.left + r.width / 2) - (window.innerWidth / 2)) / Math.max(1, window.innerWidth));
+      var score = area * (ad ? 0.90 : 1.0) + area * center * 0.08 + (sources.length ? area * 0.05 : 0);
+      // اختر أكبر فيديو محتوى أولًا؛ لا تسمح لإعلان أكبر قليلًا أن يزيح فيديو المحتوى.
+      if (!ad && score > bestScore) { bestScore = score; bestVideo = v; }
+      if (ad && score > bestAdScore) { bestAdScore = score; bestAdVideo = v; }
+      var tnow = now;
       var ct = Number(v.currentTime || 0);
-      var previous = v.__vbLastTime;
-      var previousAt = v.__vbLastAt || 0;
-      var advancing = previous !== undefined && (now - previousAt) >= 350 && ct > previous + 0.04;
+      var last = v.__vbLastTime;
+      var lastAt = Number(v.__vbLastAt || 0);
+      var playing = !v.paused && !v.ended && v.readyState >= 2;
+      // بعض مشغلات الإعلانات تستخدم عنصر MSE/blob نفسه، ثم تعيد عداد الوقت إلى الصفر للمحتوى.
+      // نعد ذلك جيل مصدر جديدًا ما لم يكن المستخدم يسحب شريط التقدم.
+      var resetAtContentBoundary = playing && last !== undefined && ct + 1.25 < last && !v.seeking && !v.__vbWasSeeking;
+      if (resetAtContentBoundary) {
+        v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
+        v.__vbCycle = Number(v.__vbCycle || 0) + 1;
+        emit(v, 'content-transition');
+      }
+      var advancing = last !== undefined && (tnow - lastAt) >= 300 && ct > last + 0.04;
       v.__vbLastTime = ct;
-      v.__vbLastAt = now;
-      var userStarted = v.__vbUserStarted === true;
-      if (!playing || !advancing || !userStarted) continue;
-      // الأحدث تفاعلًا هو الفيديو النشط حتى إذا مرّر المستخدم الصفحة بعيدًا عنه.
-      var score = Number(v.__vbUserStartedAt || 0) + Math.min(area, 100000) / 1000000;
-      if (score > bestScore) {
-        bestScore = score;
-        var sourceList = [];
-        if (src) sourceList.push(src);
-        if (v.src && sourceList.indexOf(v.src) < 0) sourceList.push(v.src);
-        var sourceNodes = v.querySelectorAll('source');
-        for (var si = 0; si < sourceNodes.length; si++) {
-          var sourceUrl = sourceNodes[si].src || sourceNodes[si].getAttribute('src') || '';
-          if (sourceUrl && sourceList.indexOf(sourceUrl) < 0) sourceList.push(sourceUrl);
+      v.__vbLastAt = tnow;
+      if (playing && advancing && v.__vbUserInitiated && !ad) {
+        var activeScore = Number(v.__vbUserInitiatedAt || 0) + area / 1000000;
+        if (!active || activeScore > active.score) {
+          active = { id: makeId(v), score: activeScore, src: src, duration: Number(v.duration || 0) };
         }
-        best = {
-          id: String(v.__vbId),
-          src: src,
-          sources: sourceList,
-          poster: v.poster || '',
-          currentTime: ct,
-          duration: Number(v.duration || 0)
-        };
+      }
+      // إذا تغير المصدر ولم يصل حدث DOM لأي سبب، أرسل تحديثًا من دورة الفحص.
+      var sourceKey = src + '||' + sources.join('||');
+      var observedAdState = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v);
+      if (sourceKey !== v.__vbSourceKey || (v.__vbAdState !== undefined && v.__vbAdState !== observedAdState)) {
+        emit(v, 'scan');
+      } else if (v.__vbAdState === undefined) {
+        emit(v, 'scan');
       }
     }
-    return JSON.stringify({a: best});
+    var primary = null;
+    if (!bestVideo) bestVideo = bestAdVideo;
+    if (bestVideo) {
+      var pv = bestVideo;
+      var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
+      var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv);
+      var pSources = collectSources(pv);
+      var pKey = psrc + '||' + pSources.join('||');
+      if (pKey !== pv.__vbSourceKey) emit(pv, 'scan');
+      primary = {
+        id: makeId(pv), src: psrc, sources: pSources,
+        sourceKey: pKey, sourceEpoch: Number(pv.__vbSourceEpoch || 0),
+        cycle: Number(pv.__vbCycle || 0), ad: !!pad,
+        adContainer: hasAdMarker(pv) || hasVisibleAdOverlay(pv), poster: absUrl(pv.poster || ''),
+        duration: Number(pv.duration || 0),
+        blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
+      };
+    }
+    return JSON.stringify({ p: primary, a: active });
   } catch (_) {
-    return JSON.stringify({a: null});
+    return JSON.stringify({ p: null, a: null });
   }
 })();
 """
-
 private const val DESKTOP_UA =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -181,19 +408,33 @@ class MainActivity : AppCompatActivity() {
     private data class SniffedMedia(
         val url: String,
         val requestedAt: Long,
-        val videoId: String
+        val videoId: String,
+        val sourceEpoch: Int
     )
 
     private class Tab(val web: WebView) {
         var title = "علامة تبويب جديدة"
         var url = ""
         var pending = false
+        // media = المصادر الجاهزة للعرض؛ preparedMedia مصدرها DOM/تهيئة المشغل،
+        // وsniffed مصادر الشبكة المرتبطة بفترة المصدر الحالية فقط.
         val media = LinkedHashMap<String, MediaItem>()
+        val preparedMedia = LinkedHashMap<String, MediaItem>()
         val sniffed = LinkedHashMap<String, SniffedMedia>()
+        // طلبات مرشحة ظهرت أثناء إعلان ما قبل التشغيل؛ لا تُعرض للمستخدم إلا بعد انتقال المصدر إلى المحتوى.
+        val pendingSniffed = LinkedHashMap<String, Long>()
+        // طلبات وسائط التقطت قبل أن ينتهي فحص DOM من تحديد عنصر الفيديو الرئيسي.
+        val pageRequests = LinkedHashMap<String, Long>()
+        var primaryVideoId: String? = null
+        var primarySourceKey = ""
+        var primarySourceEpoch = 0
+        var primaryCycle = 0
+        var primaryIsAd = false
+        var expectedDurationSec = 0.0
         var sawBlob = false
         @Volatile var activePlayback = false
         @Volatile var activeId: String? = null
-        @Volatile var userGestureVideoId: String? = null
+        val userGestureVideoIds = LinkedHashSet<String>()
         @Volatile var userGestureAt = 0L
         var poster = ""
         var lastForced = ""
@@ -201,7 +442,7 @@ class MainActivity : AppCompatActivity() {
 
     class VideoGestureBridge(
         private val onGesture: (String) -> Unit,
-        private val onStopped: (String) -> Unit
+        private val onVideoEvent: (String, String, Boolean, String, Double, Int, Int, String, Boolean) -> Unit
     ) {
         @JavascriptInterface
         fun onVideoGesture(videoId: String?) {
@@ -210,9 +451,18 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
-        fun onVideoStopped(videoId: String?) {
+        fun onVideoEvent(
+            videoId: String?, sourceKey: String?, isAd: Boolean, eventName: String?,
+            duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String?, adContainer: Boolean
+        ) {
             val id = videoId?.take(100)?.trim().orEmpty()
-            if (id.isNotEmpty()) onStopped(id)
+            if (id.isNotEmpty()) {
+                onVideoEvent(
+                    id, sourceKey?.take(12000).orEmpty(), isAd,
+                    eventName?.take(40).orEmpty(), duration,
+                    sourceEpoch, cycle, sourcesJson?.take(16000).orEmpty(), adContainer
+                )
+            }
         }
     }
 
@@ -329,7 +579,7 @@ class MainActivity : AppCompatActivity() {
         ui.removeCallbacks(scanLoop)
         cur?.let {
             it.activePlayback = false
-            it.media.clear()
+            it.activeId = null
             updateFab()
         }
         saveTabs()
@@ -519,7 +769,7 @@ class MainActivity : AppCompatActivity() {
     private fun selectTab(t: Tab) {
         cur?.let {
             it.activePlayback = false
-            it.media.clear()
+            it.activeId = null
             content.removeView(it.web)
             it.web.onPause()
         }
@@ -540,7 +790,12 @@ class MainActivity : AppCompatActivity() {
         val i = tabs.indexOf(t)
         tabs.remove(t)
         t.activePlayback = false
+        t.activeId = null
         t.media.clear()
+        t.preparedMedia.clear()
+        t.sniffed.clear()
+        t.pendingSniffed.clear()
+        t.pageRequests.clear()
         content.removeView(t.web)
         t.web.destroy()
         if (cur === t) cur = null
@@ -594,20 +849,19 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
         w.addJavascriptInterface(VideoGestureBridge(
             onGesture = { id ->
-                tab.userGestureVideoId = id
-                tab.userGestureAt = System.currentTimeMillis()
-            },
-            onStopped = { id ->
-                if (tab.userGestureVideoId == id) {
-                    tab.userGestureVideoId = null
-                    tab.userGestureAt = 0L
-                    tab.activePlayback = false
-                    tab.activeId = null
-                    ui.post {
-                        tab.media.clear()
-                        if (cur === tab) updateFab()
+                ui.post {
+                    // لا نحذف التفاعل عند pause/ended؛ فقد يكون هذا انتقالًا من إعلان قصير إلى المحتوى.
+                    tab.userGestureVideoIds.add(id)
+                    tab.userGestureAt = System.currentTimeMillis()
+                    if (tab.userGestureVideoIds.size > 12) {
+                        val keep = tab.userGestureVideoIds.toList().takeLast(8)
+                        tab.userGestureVideoIds.clear()
+                        tab.userGestureVideoIds.addAll(keep)
                     }
                 }
+            },
+            onVideoEvent = { id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer ->
+                handleVideoEvent(tab, id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer)
             }
         ), "VBVideoGesture")
 
@@ -630,14 +884,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
                 val t = tabOf(v) ?: return
                 t.url = url
-                t.media.clear()
-                t.sniffed.clear()
-                t.activePlayback = false
-                t.activeId = null
-                t.userGestureVideoId = null
-                t.userGestureAt = 0L
-                t.sawBlob = false
-                t.poster = ""
+                resetVideoSession(t)
                 if (t === cur) { urlBar.setText(url); updateFab() }
             }
 
@@ -651,8 +898,8 @@ class MainActivity : AppCompatActivity() {
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
-                // نسجل مصادر الفيديو المحتملة فقط، وبعد نقرة المستخدم على عنصر فيديو.
-                // لا نسجل الصور المصغرة أو المعاينات أو مقاطع HLS/DASH الجزئية.
+                // نخزن الطلبات المرشحة داخليًا فقط إذا أمكن ربطها لاحقًا بعنصر الفيديو الرئيسي.
+                // لا يظهر أي عداد أو رابط خام للمستخدم، وتُرفض الإعلانات والمعاينات والمقاطع الجزئية.
                 if (!r.isForMainFrame && isCandidateMediaRequest(u)) {
                     ui.post { rec(tab, u) }
                 }
@@ -714,8 +961,11 @@ class MainActivity : AppCompatActivity() {
         Store.putEntries(this, "history", l)
     }
 
-    // ---------------------------------------------------------------- كشف الفيديو الذي بدأه المستخدم ويعمل فعليًا
+    // ---------------------------------------------------------------- اكتشاف الفيديو الرئيسي واستبعاد الإعلانات والمعاينات
+    private fun isLikelyAdUrl(raw: String): Boolean = Formats.isAdUrl(raw)
+
     private fun isExcludedMediaUrl(raw: String): Boolean {
+        if (isLikelyAdUrl(raw)) return true
         val decoded = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
         val uri = Uri.parse(decoded)
         val pathAndQuery = (uri.path.orEmpty() + "?" + uri.query.orEmpty()).lowercase()
@@ -754,33 +1004,170 @@ class MainActivity : AppCompatActivity() {
             .any { path.endsWith(it) }
         if (directVideo) return true
         if (path.contains("/videoplayback")) {
-            // استبعد طلبات المقاطع المتتابعة/المجزأة؛ اقبل رابط التشغيل الكامل فقط.
             return uri.getQueryParameter("sq") == null && uri.getQueryParameter("range") == null
         }
         return false
     }
 
-    private fun rec(t: Tab, url: String) {
-        if (!isCandidateMediaRequest(url)) return
+    private fun resetVideoSession(t: Tab) {
+        t.media.clear()
+        t.preparedMedia.clear()
+        t.sniffed.clear()
+        t.pendingSniffed.clear()
+        t.pageRequests.clear()
+        t.primaryVideoId = null
+        t.primarySourceKey = ""
+        t.primarySourceEpoch = 0
+        t.primaryCycle = 0
+        t.primaryIsAd = false
+        t.expectedDurationSec = 0.0
+        t.activePlayback = false
+        t.activeId = null
+        t.userGestureVideoIds.clear()
+        t.userGestureAt = 0L
+        t.sawBlob = false
+        t.poster = ""
+    }
+
+    private fun syncMedia(t: Tab) {
+        t.media.clear()
+        t.preparedMedia.forEach { (url, item) -> t.media[url] = item }
+        val id = t.primaryVideoId ?: return
+        if (t.primaryIsAd) return
         val now = System.currentTimeMillis()
-        val gestureId = t.userGestureVideoId ?: return
-        val gestureAge = now - t.userGestureAt
-        // الطلبات قد تبدأ مباشرة بعد نقرة التشغيل وقبل أول حدث playing.
-        // وبعد بدء التشغيل نسمح بطلبات الجودة المرتبطة بمعرّف عنصر الفيديو نفسه.
-        val sameActiveVideo = t.activePlayback && t.activeId == gestureId
-        if (!sameActiveVideo && gestureAge !in 0L..20_000L) return
-        t.sniffed[url] = SniffedMedia(url, now, gestureId)
-        while (t.sniffed.size > 40) {
+        t.sniffed.values
+            .filter { it.videoId == id && it.sourceEpoch == t.primarySourceEpoch && now - it.requestedAt in 0L..180_000L }
+            .forEach { captured ->
+                if (isCandidateMediaRequest(captured.url)) {
+                    t.media[captured.url] = MediaItem(captured.url, if (isHlsUrl(captured.url)) "hls" else "direct", "network", id, captured.sourceEpoch)
+                }
+            }
+    }
+
+    private fun addPreparedSource(t: Tab, url: String, videoId: String) {
+        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return
+        if (!isCandidateMediaRequest(url)) return
+        val type = if (isHlsUrl(url)) "hls" else "direct"
+        t.preparedMedia[url] = MediaItem(url, type, "dom", videoId, t.primarySourceEpoch)
+    }
+
+    private fun promotePageRequests(t: Tab, id: String, epoch: Int, isAd: Boolean) {
+        val now = System.currentTimeMillis()
+        t.pageRequests.entries.removeAll { now - it.value !in 0L..90_000L }
+        t.pageRequests.forEach { (url, time) ->
+            if (now - time <= 90_000L && isCandidateMediaRequest(url)) {
+                if (isAd) t.pendingSniffed[url] = time
+                else t.sniffed[url] = SniffedMedia(url, time, id, epoch)
+            }
+        }
+        t.pageRequests.clear()
+    }
+
+    private fun advanceSniffedEpochForContent(t: Tab, id: String, epoch: Int) {
+        val now = System.currentTimeMillis()
+        val recent = t.sniffed.values.filter {
+            it.videoId == id && now - it.requestedAt in 0L..120_000L
+        }
+        t.sniffed.entries.removeAll { it.value.videoId == id }
+        recent.forEach { old ->
+            t.sniffed[old.url] = SniffedMedia(old.url, old.requestedAt, id, epoch)
+        }
+    }
+
+    private fun promotePendingSniffed(t: Tab, id: String, epoch: Int) {
+        val now = System.currentTimeMillis()
+        t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
+        t.pendingSniffed.forEach { (url, time) ->
+            if (now - time <= 120_000L && isCandidateMediaRequest(url)) {
+                t.sniffed[url] = SniffedMedia(url, time, id, epoch)
+            }
+        }
+        t.pendingSniffed.clear()
+        while (t.sniffed.size > 80) {
             val oldest = t.sniffed.keys.firstOrNull() ?: break
             t.sniffed.remove(oldest)
         }
     }
 
-    private fun addTo(t: Tab, url: String) {
-        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return
-        if (isExcludedMediaUrl(url)) return
-        if (!isHlsUrl(url) && isStreamingChunkRequest(url)) return
-        t.media[url] = MediaItem(url, if (isHlsUrl(url)) "hls" else "direct")
+    private fun handleVideoEvent(
+        t: Tab, id: String, sourceKey: String, isAd: Boolean, event: String,
+        duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String, adContainer: Boolean
+    ) {
+        ui.post {
+            if (tabs.none { it === t }) return@post
+            // لا ننسب أحداث عناصر المعاينة أو الإعلان إلى الفيديو الرئيسي قبل أن يحدده فحص DOM.
+            if (t.primaryVideoId == null || t.primaryVideoId != id) return@post
+
+            val generationChanged = (t.primarySourceKey.isNotEmpty() && t.primarySourceKey != sourceKey) ||
+                t.primarySourceEpoch != sourceEpoch || t.primaryCycle != cycle
+            val wasAd = t.primaryIsAd
+            val nowAd = isAd || adContainer
+            if (generationChanged) {
+                if (wasAd && !nowAd) advanceSniffedEpochForContent(t, id, sourceEpoch)
+                else t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
+                if (!wasAd && !nowAd) {
+                    t.preparedMedia.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
+                }
+            }
+            t.primarySourceKey = sourceKey
+            t.primarySourceEpoch = sourceEpoch
+            t.primaryCycle = cycle
+            t.primaryIsAd = nowAd
+            // لا تسجل مدة الإعلان على أنها مدة المحتوى. تُحدّث المدة فقط بعد زوال علامات الإعلان.
+            if (!nowAd && duration.isFinite() && duration > 0.0) t.expectedDurationSec = duration
+            // احتفظ بمصادر المحتوى المسبقة التي عثرنا عليها في إعدادات المشغل أثناء الإعلان.
+            // أضف المصادر الجديدة التي استخرجها DOM؛ addPreparedSource يستبعد روابط الإعلان الصريحة.
+            if (sourcesJson.isNotBlank()) {
+                try {
+                    val arr = org.json.JSONArray(sourcesJson)
+                    for (i in 0 until arr.length()) addPreparedSource(t, arr.optString(i), id)
+                } catch (_: Exception) {
+                }
+            }
+            if (wasAd && !nowAd) promotePendingSniffed(t, id, sourceEpoch)
+            if (t.primaryIsAd || event == "pause" || event == "ended" || event == "emptied") {
+                t.activePlayback = false
+                t.activeId = null
+            }
+            syncMedia(t)
+            if (cur === t) updateFab()
+        }
+    }
+
+    private fun rec(t: Tab, url: String) {
+        if (!isCandidateMediaRequest(url)) return
+        // قد تُطلب قائمة الجودة قبل أن يكتمل أول فحص DOM؛ احتفظ بمرشحات قصيرة العمر
+        // حتى نحدد عنصر الفيديو الرئيسي ثم نربطها به بدل إسقاطها.
+        val id = t.primaryVideoId
+        val now = System.currentTimeMillis()
+        if (id == null) {
+            t.pageRequests[url] = now
+            t.pageRequests.entries.removeAll { now - it.value !in 0L..90_000L }
+            while (t.pageRequests.size > 80) {
+                val oldest = t.pageRequests.keys.firstOrNull() ?: break
+                t.pageRequests.remove(oldest)
+            }
+            return
+        }
+        // تُجهّز مصادر مشغل الفيديو الرئيسي منذ تحميل صفحة المشاهدة، حتى قبل ضغط Play.
+        // لا يغيّر ذلك لون الزر؛ فالتفعيل الأحمر ما زال يتطلب تشغيلًا فعليًا بدأه المستخدم.
+        if (t.primaryIsAd) {
+            // لا نعرض مصادر فترة الإعلان، لكن نحتفظ مؤقتًا بالطلبات المرشحة غير المعلّمة
+            // لنربط طلبات المحتوى التي بدأ تحميلها قبل انتقال المشغل من الإعلان إلى الفيلم.
+            t.pendingSniffed[url] = now
+            t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
+            while (t.pendingSniffed.size > 100) {
+                val oldest = t.pendingSniffed.keys.firstOrNull() ?: break
+                t.pendingSniffed.remove(oldest)
+            }
+            return
+        }
+        t.sniffed[url] = SniffedMedia(url, now, id, t.primarySourceEpoch)
+        while (t.sniffed.size > 80) {
+            val oldest = t.sniffed.keys.firstOrNull() ?: break
+            t.sniffed.remove(oldest)
+        }
+        syncMedia(t)
     }
 
     private fun scan(t: Tab) {
@@ -797,71 +1184,69 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onScan(t: Tab, o: JSONObject) {
+        val p = o.optJSONObject("p")
+        if (p == null) {
+            t.activePlayback = false
+            t.activeId = null
+            // لا نمسح المصادر المحضّرة لمجرد أن العنصر خرج مؤقتًا من DOM/الرؤية.
+            if (cur === t) updateFab()
+            return
+        }
+
+        val id = p.optString("id")
+        if (id.isBlank()) return
+        val key = p.optString("sourceKey")
+        val epoch = p.optInt("sourceEpoch", 0)
+        val cycle = p.optInt("cycle", 0)
+        val isAd = p.optBoolean("ad", false)
+        val adContainer = p.optBoolean("adContainer", false)
+        val sourceChanged = t.primaryVideoId != id || t.primarySourceKey != key ||
+            t.primarySourceEpoch != epoch || t.primaryCycle != cycle
+        val wasAd = t.primaryIsAd
+        val nowAd = isAd || adContainer
+
+        val primaryChanged = t.primaryVideoId != id
+        if (primaryChanged) {
+            t.media.clear()
+            t.preparedMedia.clear()
+            t.sniffed.clear()
+            t.pendingSniffed.clear()
+            t.userGestureVideoIds.removeAll { it != id }
+        } else if (sourceChanged) {
+            if (wasAd && !nowAd) advanceSniffedEpochForContent(t, id, epoch)
+            else t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != epoch }
+            if (!wasAd && !nowAd) {
+                t.preparedMedia.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != epoch }
+            }
+        }
+
+        t.primaryVideoId = id
+        t.primarySourceKey = key
+        t.primarySourceEpoch = epoch
+        t.primaryCycle = cycle
+        t.primaryIsAd = nowAd
+        if (primaryChanged) promotePageRequests(t, id, epoch, nowAd)
+        val src = p.optString("src")
+        t.sawBlob = p.optBoolean("blob", src.startsWith("blob:", true))
+        t.poster = p.optString("poster")
+        val duration = p.optDouble("duration", 0.0)
+        // مدة عنصر الفيديو أثناء preroll تخص الإعلان؛ لا تستبدل بها مدة الفيلم الرئيسي.
+        if (!nowAd && duration.isFinite() && duration > 0.0) t.expectedDurationSec = duration
+        if (wasAd && !nowAd) promotePendingSniffed(t, id, epoch)
+
+        // تجهّز المصادر من DOM وإعدادات المشغل قبل بدء التشغيل، وتبقى محفوظة أثناء الإعلان.
+        // JavaScript يستبعد currentSrc عند ظهور علامات الإعلان، بينما يستخرج مصادر المحتوى من config.
+        val arr = p.optJSONArray("sources")
+        if (arr != null) {
+            for (i in 0 until arr.length()) addPreparedSource(t, arr.optString(i), id)
+        }
+
         val a = o.optJSONObject("a")
-        if (a == null) {
-            t.activePlayback = false
-            t.activeId = null
-            t.media.clear()
-            t.sawBlob = false
-            updateFab()
-            return
-        }
-
-        val id = a.optString("id")
-        val now = System.currentTimeMillis()
-        // يحتفظ عنصر الفيديو بحالة userStarted حتى pause/ended؛ لا تنتهي الصلاحية
-        // بعد مدة طويلة إذا استمر الفيديو نفسه في التشغيل.
-        val gestureMatches = t.userGestureVideoId == id
-        if (id.isBlank() || !gestureMatches) {
-            t.activePlayback = false
-            t.activeId = null
-            t.media.clear()
-            updateFab()
-            return
-        }
-
-        if (id != t.activeId) {
-            t.activeId = id
-            t.media.clear()
-        }
-        t.activePlayback = true
-        val src = a.optString("src")
-        t.poster = a.optString("poster")
-        t.sawBlob = src.startsWith("blob:", true)
-        t.media.clear()
-
-        // استخدم مصادر عنصر الفيديو نفسه أولًا، بما فيها عناصر <source> البديلة.
-        val directSources = LinkedHashSet<String>()
-        val sourceArray = a.optJSONArray("sources")
-        if (sourceArray != null) {
-            for (i in 0 until sourceArray.length()) {
-                val sourceUrl = sourceArray.optString(i)
-                if (sourceUrl.startsWith("http://", true) || sourceUrl.startsWith("https://", true)) {
-                    directSources.add(sourceUrl)
-                }
-            }
-        }
-        if (directSources.isEmpty() &&
-            (src.startsWith("http://", true) || src.startsWith("https://", true))) {
-            directSources.add(src)
-        }
-
-        if (directSources.isNotEmpty()) {
-            directSources.forEach { addTo(t, it) }
-        } else {
-            val captured = t.sniffed.values
-                .filter { it.videoId == id && now - it.requestedAt in 0L..120_000L }
-                .sortedByDescending { it.requestedAt }
-            // في MSE/Blob نفضّل قوائم HLS المرتبطة بنقرة الفيديو نفسه،
-            // ثم روابط ملفات الفيديو الكاملة فقط، ولا نعرض مقاطع النقل الخام.
-            val playlists = captured.filter { isHlsUrl(it.url) }
-            if (playlists.isNotEmpty()) {
-                playlists.take(6).forEach { addTo(t, it.url) }
-            } else {
-                captured.map { it.url }.distinct().take(8).forEach { addTo(t, it) }
-            }
-        }
-        updateFab()
+        val gestureMatches = id in t.userGestureVideoIds
+        t.activePlayback = a != null && a.optString("id") == id && gestureMatches && !t.primaryIsAd
+        t.activeId = if (t.activePlayback) id else null
+        syncMedia(t)
+        if (cur === t) updateFab()
     }
 
     private fun headersFor(t: Tab, w: WebView = t.web): Map<String, String> {
@@ -880,50 +1265,81 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFabClick() {
         val t = cur ?: return
-        if (!t.activePlayback) {
-            toast("شغّل الفيديو بالضغط عليه أولًا؛ سيصبح الزر أحمر عند بدء التشغيل")
+        val videoId = t.primaryVideoId
+        if (videoId == null || t.media.isEmpty()) {
+            val message = when {
+                t.primaryIsAd -> "المشغل يعرض إعلانًا حاليًا؛ يتم تجهيز روابط المحتوى الرئيسي بعد انتقال المشغل إليه"
+                t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE؛ انتظر تحميل مصدر المحتوى أو ابدأ تشغيله بعد الإعلان"
+                else -> "لم تُكتشف مصادر الفيديو الرئيسي بعد؛ انتظر اكتمال تهيئة المشغل"
+            }
+            toast(message)
             return
         }
-        if (t.media.isEmpty()) {
-            toast(
-                if (t.sawBlob) "مصدر الفيديو يستخدم Blob/MSE ولم يتم العثور على قائمة أو ملف فيديو قابل للتنزيل"
-                else "لم يتم التعرف على رابط تنزيل مباشر لهذا الفيديو"
-            )
-            return
-        }
-        val activeId = t.activeId
-        toast("جارٍ جلب جودات الفيديو الجاري تشغيله...")
+        val expectedDuration = t.expectedDurationSec
+        val sourceEpoch = t.primarySourceEpoch
+        toast(if (t.activePlayback) "جارٍ جلب جودات الفيديو الجاري تشغيله..." else "جارٍ جلب الجودات المحضّرة للفيديو الرئيسي...")
         val items = t.media.values.toList()
         val headers = headersFor(t)
         val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
         io.execute {
-            val resolved = ArrayList<List<Format>>()
+            val resolvedGroups = ArrayList<Pair<MediaItem, List<Format>>>()
             for (item in items) {
                 try {
                     val formats = Formats.resolve(item, headers)
-                    if (formats.isNotEmpty()) resolved.add(formats)
+                    if (formats.isNotEmpty()) resolvedGroups.add(item to formats)
                 } catch (_: Exception) {
                 }
             }
-            // عند وجود قائمة HLS Master نستخدم جوداتها بدل جمع روابط المقاطع/الطلبات الخام.
-            val masterFormats = resolved
-                .filter { group -> group.any { it.fromMaster && !it.isAudio } }
-                .maxByOrNull { group -> group.count { it.fromMaster && !it.isAudio } }
-            val sourceFormats = masterFormats ?: resolved.flatten()
-            val clean = sourceFormats
+
+            // إذا أصبحت مدة المحتوى معروفة، استبعد مجموعة مصدر قصيرة/قديمة لا تطابق مدة الفيديو.
+            // لا نستخدم هذا الشرط قبل معرفة مدة المحتوى؛ فقد يكون إعلان ما قبل التشغيل هو الذي يعرض مدته مؤقتًا.
+            val durationFiltered = resolvedGroups.filter { (_, group) ->
+                val candidateDuration = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
+                when {
+                    candidateDuration <= 0.0 -> true
+                    expectedDuration > 20.0 -> abs(candidateDuration - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
+                    expectedDuration in 1.0..12.0 -> candidateDuration >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                    else -> true
+                }
+            }
+            val hasLongContentAlternative = expectedDuration in 1.0..12.0 &&
+                resolvedGroups.any { (_, group) ->
+                    val candidateDuration = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
+                    candidateDuration >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                }
+            val longestKnownDuration = resolvedGroups.maxOfOrNull { (_, group) ->
+                group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
+            } ?: 0.0
+            val contentLengthFiltered = if (expectedDuration <= 0.0 && longestKnownDuration > 20.0) {
+                resolvedGroups.filter { (_, group) ->
+                    val d = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
+                    d <= 0.0 || d >= maxOf(20.0, longestKnownDuration * 0.35)
+                }
+            } else resolvedGroups
+            val usableGroups = when {
+                expectedDuration > 20.0 -> durationFiltered
+                hasLongContentAlternative -> durationFiltered
+                expectedDuration <= 0.0 && longestKnownDuration > 20.0 -> contentLengthFiltered
+                else -> resolvedGroups
+            }
+            val masterGroup = usableGroups
+                .filter { (_, group) -> group.any { it.fromMaster && !it.isAudio } }
+                .maxByOrNull { (_, group) -> group.count { it.fromMaster && !it.isAudio } }
+            val chosenGroups = if (masterGroup != null) listOf(masterGroup) else usableGroups
+            val clean = chosenGroups.flatMap { it.second }
                 .filter { f ->
-                    !f.isAudio && !Formats.isAudio(f.ext) &&
+                    !f.isAudio && !Formats.isAudio(f.ext) && !isExcludedMediaUrl(f.url) &&
                         (f.kind == "hls" || Util.kindOf("x." + f.ext) == "video")
                 }
                 .distinctBy { f -> f.url }
                 .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
             ui.post {
                 if (isFinishing || isDestroyed) return@post
-                // لا نعرض نتائج مصدر قديم إذا انتقل المستخدم إلى فيديو أو تبويب آخر أثناء التحليل.
-                if (cur !== t || !t.activePlayback || t.activeId != activeId) return@post
+                // لا نعرض نتائج إعلان/فيديو/فترة مصدر سابقة بعد انتقال المشغل إلى محتوى آخر.
+                if (cur !== t || t.primaryVideoId != videoId || t.primarySourceEpoch != sourceEpoch) return@post
                 if (clean.isEmpty()) {
-                    toast("لم أتمكن من استخراج جودات قابلة للتنزيل لهذا الفيديو")
+                    toast("لم أتمكن من استخراج جودات الفيديو الرئيسي؛ قد يكون المصدر محميًا أو غير مكشوف للصفحة")
                 } else {
                     showFormatSheet(clean, headers, title, poster)
                 }

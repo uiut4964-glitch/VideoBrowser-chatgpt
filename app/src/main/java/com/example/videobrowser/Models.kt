@@ -3,7 +3,13 @@ package com.example.videobrowser
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-class MediaItem(val url: String, val type: String)
+class MediaItem(
+    val url: String,
+    val type: String,
+    val origin: String = "dom",
+    val videoId: String = "",
+    val sourceEpoch: Int = 0
+)
 
 class Format(
     val label: String,

@@ -10,6 +10,17 @@ object Formats {
 
     fun isAudio(ext: String): Boolean = ext in setOf("mp3", "m4a", "aac", "ogg", "wav")
 
+    fun isAdUrl(raw: String): Boolean {
+        val s = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+        val lower = s.lowercase(Locale.ROOT)
+        if (listOf(
+                "doubleclick", "googlesyndication", "googleadservices", "adservice", "adserver",
+                "imasdk", "vasttag", "spotx", "freewheel", "adnxs", "adsystem", "advertising"
+            ).any { lower.contains(it) }) return true
+        val pattern = Regex("(?:^|[/_.?&=\\-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[/_.?&=\\-]|$)")
+        return pattern.containsMatchIn(lower)
+    }
+
     fun extOf(url: String, mime: String): String {
         val path = url.substringBefore('?').substringBefore('#')
         val e = path.substringAfterLast('.', "").lowercase()
@@ -71,6 +82,7 @@ object Formats {
 
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
+        if (isAdUrl(item.url)) return out
         if (item.type == "hls") {
             val text = Net.fetchText(item.url, h)
             if (Hls.isMaster(text)) {
@@ -79,6 +91,7 @@ object Formats {
                         .thenByDescending { it.bandwidth }
                 )
                 for (v in vars) {
+                    if (isAdUrl(v.url)) continue
                     var dur = 0.0
                     var est = -1L
                     var w = 0
@@ -102,7 +115,7 @@ object Formats {
                     if (est <= 0 && v.bandwidth > 0 && dur > 0) est = (v.bandwidth / 8 * dur).toLong()
                     out.add(Format(label, v.resolution, v.url, "hls", "ts", true, fmtEst(est), false, dur, est))
                 }
-                for (a in Hls.parseAudio(text, item.url).take(3)) {
+                for (a in Hls.parseAudio(text, item.url).filterNot { isAdUrl(it.url) }.take(3)) {
                     var est = -1L
                     var dur = 0.0
                     try {
