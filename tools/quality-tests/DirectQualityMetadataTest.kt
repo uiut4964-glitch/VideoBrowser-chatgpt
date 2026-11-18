@@ -33,4 +33,27 @@ fun main() {
         "codec-prefixed quality labels collapsed or misordered: $distinctRanks"
     }
     println("Codec-prefixed label regression test passed: $distinctRanks")
+
+    // A player-declared signed rendition should remain selectable when the CDN rejects Range probing.
+    val blockedProbeUrl = "https://cdn.example/opaque-player-file?sig=temporary"
+    Net.probeFailures[blockedProbeUrl] = "HTTP 403 on Range probe"
+    val fallback = Formats.resolve(
+        MediaItem(blockedProbeUrl, "direct", "dom", "player-2", 1,
+            qualityHint = "1080p", heightHint = 1080, mimeHint = "video/mp4"),
+        emptyMap()
+    ).singleOrNull() ?: error("trusted player rendition disappeared when Range probe failed")
+    check(fallback.label.contains("1080P"))
+    check(fallback.bytes == -1L) { "failed probe must not invent an estimated file size" }
+    check(fallback.details.contains("بدون معلومات Range"))
+    println("Direct resolver fallback test passed: trusted 1080p source survives a blocked Range probe")
+
+    val tinyTrustedUrl = "https://cdn.example/short-original?quality=240p"
+    Net.probes[tinyTrustedUrl] = Net.Probe(18_000L, true, "video/mp4")
+    val tinyTrusted = Formats.resolve(
+        MediaItem(tinyTrustedUrl, "direct", "dom", "player-3", 1,
+            qualityHint = "240p", heightHint = 240, mimeHint = "video/mp4"),
+        emptyMap()
+    ).singleOrNull() ?: error("small but explicitly-declared original video was rejected")
+    check(tinyTrusted.label.contains("240P"))
+    println("Small trusted-video test passed: explicitly declared short source is retained")
 }

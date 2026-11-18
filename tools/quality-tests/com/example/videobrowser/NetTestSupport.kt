@@ -7,13 +7,16 @@ object Net {
     class Probe(val total: Long, val rangeOk: Boolean, val mime: String)
     val docs = mutableMapOf<String, String>()
     val probes = mutableMapOf<String, Probe>()
+    val probeFailures = mutableMapOf<String, String>()
     fun fetchText(url: String, h: Map<String, String>): String =
         docs[url] ?: throw IOException("missing test manifest: $url")
     fun readRangeBytes(url: String, h: Map<String, String>, s: Long, l: Long): ByteArray =
         ByteArray(l.coerceAtMost(188).toInt())
     fun readBytes(url: String, h: Map<String, String>): ByteArray = ByteArray(188)
-    fun probe(url: String, h: Map<String, String>): Probe =
-        probes[url] ?: Probe(1_000_000L, true, "video/mp4")
+    fun probe(url: String, h: Map<String, String>): Probe {
+        probeFailures[url]?.let { throw IOException(it) }
+        return probes[url] ?: Probe(1_000_000L, true, "video/mp4")
+    }
 }
 
 object Util {

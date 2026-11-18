@@ -67,6 +67,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ExecutionException
 import kotlin.math.abs
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
@@ -184,7 +186,17 @@ private const val SCAN_JS = """
         if (w > 0 && w < 10000) meta.width = w;
         if (h > 0 && h < 10000) meta.height = h;
         var mime = raw.mimeType || raw.mime_type || raw.contentType || raw.content_type || raw.type || '';
-        if (mime && /^(video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl)|audio\/)/i.test(String(mime))) meta.mime = String(mime);
+        if (mime && /^(video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|audio\/)/i.test(String(mime))) meta.mime = String(mime);
+        var codec = raw.codecs || raw.codec || raw.videoCodec || raw.video_codec || raw.videoCodecName || '';
+        if (codec) meta.codec = String(codec).slice(0, 160);
+        var fps = Number(raw.frameRate || raw.frame_rate || raw.fps || raw.frameRateHint || 0);
+        if (fps > 0 && fps <= 240) meta.frameRate = fps;
+        var range = raw.videoRange || raw.video_range || raw.dynamicRange || raw.hdr || raw.colorSpace || '';
+        if (range) meta.dynamicRange = String(range).slice(0, 80);
+        var bandwidth = Number(raw.averageBandwidth || raw.average_bandwidth || raw.bandwidth || raw.bitrate || 0);
+        if (bandwidth > 0 && bandwidth < 1000000000) meta.bandwidth = bandwidth;
+        var representationId = raw.representationId || raw.representation_id || raw.formatId || raw.itag || raw.id || '';
+        if (representationId !== '') meta.representationId = String(representationId).slice(0, 120);
       }
       if (keyHint) {
         var key = String(keyHint).trim();
@@ -279,6 +291,11 @@ private const val SCAN_JS = """
         if (incoming.width && !existing.width) existing.width = incoming.width;
         if (incoming.height && !existing.height) existing.height = incoming.height;
         if (incoming.mime && !existing.mime) existing.mime = incoming.mime;
+        if (incoming.codec && !existing.codec) existing.codec = incoming.codec;
+        if (incoming.frameRate && !existing.frameRate) existing.frameRate = incoming.frameRate;
+        if (incoming.dynamicRange && !existing.dynamicRange) existing.dynamicRange = incoming.dynamicRange;
+        if (incoming.bandwidth && !existing.bandwidth) existing.bandwidth = incoming.bandwidth;
+        if (incoming.representationId && !existing.representationId) existing.representationId = incoming.representationId;
         if (activeApiContext) {
           if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
             existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
@@ -886,6 +903,8 @@ class MainActivity : AppCompatActivity() {
         @Volatile var resolvedFormats: List<Format>? = null
         @Volatile var resolvedKey = ""
         @Volatile var resolvingKey = ""
+        @Volatile var lastResolveReport = "لم يبدأ تحليل المصادر بعد"
+        @Volatile var lastResolveCandidateCount = 0
         @Volatile var activeId: String? = null
         val userGestureVideoIds = LinkedHashSet<String>()
         @Volatile var userGestureAt = 0L
@@ -930,6 +949,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fabIcon: ImageView
     private lateinit var tabBtn: TextView
     private val io = Executors.newCachedThreadPool()
+    // Resolve at most four candidate sources at once to reduce page-start latency without flooding CDNs.
+    private val qualityResolver = Executors.newFixedThreadPool(4)
     private val ui = Handler(Looper.getMainLooper())
     private var customView: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
@@ -1053,6 +1074,8 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         MediaCaptureCoordinator.detach(this)
         ui.removeCallbacksAndMessages(null)
+        qualityResolver.shutdownNow()
+        io.shutdownNow()
         content.removeAllViews()
         tabs.forEach {
             try { it.documentStartScript?.remove() } catch (_: Exception) {}
@@ -1691,6 +1714,8 @@ class MainActivity : AppCompatActivity() {
         t.resolvedFormats = null
         t.resolvedKey = ""
         t.resolvingKey = ""
+        t.lastResolveReport = "لم يبدأ تحليل المصادر بعد"
+        t.lastResolveCandidateCount = 0
         t.activePlayback = false
         t.activeId = null
         t.userGestureVideoIds.clear()
@@ -1729,10 +1754,13 @@ class MainActivity : AppCompatActivity() {
                             prepared?.heightHint ?: 0,
                             prepared?.mimeHint.orEmpty(),
                             CaptureHeaders.merge(
-                                emptyMap(),
+                                prepared?.requestHeaders.orEmpty(),
                                 captured.request?.headers.orEmpty()
                             ),
-                            captured.request?.source.orEmpty()
+                            captured.request?.source.orEmpty(),
+                            prepared?.codecHint.orEmpty(), prepared?.frameRateHint ?: 0.0,
+                            prepared?.dynamicRangeHint.orEmpty(), prepared?.bandwidthHint ?: 0L,
+                            prepared?.representationIdHint.orEmpty()
                         )
                     }
                 }
@@ -1749,9 +1777,41 @@ class MainActivity : AppCompatActivity() {
                 val headerKey = item.requestHeaders.entries
                     .sortedBy { header -> header.key.lowercase() }
                     .joinToString(";") { header -> "${header.key}:${header.value}" }
-                "${item.origin}|${item.type}|${item.url}|${item.qualityHint}|${item.widthHint}x${item.heightHint}|${item.mimeHint}|${item.captureSource}|$headerKey"
+                "${item.origin}|${item.type}|${item.url}|${item.qualityHint}|${item.widthHint}x${item.heightHint}|${item.mimeHint}|${item.codecHint}|${item.frameRateHint}|${item.dynamicRangeHint}|${item.bandwidthHint}|${item.representationIdHint}|${item.captureSource}|$headerKey"
             }
         return "$id|${t.primarySourceEpoch}|${t.primaryCurrentSrc}|${t.primaryIsAd}|${t.suspectedPreroll}|${"%.1f".format(java.util.Locale.US, t.expectedDurationSec)}|$sources"
+    }
+
+    private data class ResolveOutcome(
+        val formats: List<Format>,
+        val attempted: Int,
+        val resolvedSources: Int,
+        val emptySources: Int,
+        val rejectedByContentFilter: Int,
+        val failures: List<String>
+    ) {
+        fun summary(): String = buildString {
+            append("المصادر المرشحة: ").append(attempted)
+            append(" | مصادر أنتجت نتائج: ").append(resolvedSources)
+            append(" | مصادر بلا صيغ: ").append(emptySources)
+            append(" | صيغ استبعدها فلتر المحتوى: ").append(rejectedByContentFilter)
+            append(" | صيغ الفيديو النهائية: ").append(formats.size)
+            if (failures.isNotEmpty()) {
+                append("\nأسباب تعذر التحليل:")
+                failures.take(5).forEach { append("\n• ").append(it) }
+            }
+            if (formats.isEmpty() && failures.isEmpty()) {
+                append("\nلم ينتج أي مصدر صيغة فيديو مقبولة؛ تحقق من نوع الاستجابة أو تصنيف الإعلان/المعاينة.")
+            }
+        }
+    }
+
+    private fun shortResolveError(error: Throwable): String {
+        val message = (error.message ?: error.javaClass.simpleName)
+            .replace(Regex("https?://\\S+"), "[رابط مخفي]")
+            .replace(Regex("[?&](token|sig|signature|auth|key|expires|session)=[^&\\s]+", RegexOption.IGNORE_CASE), "[معامل مخفي]")
+            .take(180)
+        return message.ifBlank { error.javaClass.simpleName }
     }
 
     private fun resolveQualityGroups(
@@ -1760,16 +1820,29 @@ class MainActivity : AppCompatActivity() {
         expectedDuration: Double,
         isAdOrPreroll: Boolean,
         currentSrc: String
-    ): List<Format> {
+    ): ResolveOutcome {
+        if (items.isEmpty()) return ResolveOutcome(emptyList(), 0, 0, 0, 0, emptyList())
+
+        // Four workers maximum; collect in source order so row order stays deterministic.
+        val candidates = items.take(48)
+        val futures = candidates.map { item -> item to qualityResolver.submit<List<Format>> { Formats.resolve(item, headers) } }
         val groups = ArrayList<Pair<MediaItem, List<Format>>>()
-        for (item in items) {
+        val failures = ArrayList<String>()
+        var emptySources = 0
+        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(70)
+        for ((item, future) in futures) {
             try {
-                val formats = Formats.resolve(item, headers)
-                if (formats.isNotEmpty()) groups.add(item to formats)
-            } catch (_: Exception) {
+                val remainingNanos = deadlineNanos - System.nanoTime()
+                if (remainingNanos <= 0L) throw java.util.concurrent.TimeoutException("انتهت مهلة تحليل مجموعة المصادر")
+                val result = future.get(remainingNanos, TimeUnit.NANOSECONDS)
+                if (result.isEmpty()) emptySources++ else groups.add(item to result)
+            } catch (e: Exception) {
+                future.cancel(true)
+                val cause = if (e is ExecutionException) (e.cause ?: e) else e
+                val host = try { Uri.parse(item.url).host ?: "مصدر" } catch (_: Exception) { "مصدر" }
+                failures.add("$host: ${shortResolveError(cause)}")
             }
         }
-        if (groups.isEmpty()) return emptyList()
 
         fun duration(group: List<Format>): Double =
             group.map { it.durSec }.filter { it.isFinite() && it > 0.0 }.maxOrNull() ?: 0.0
@@ -1779,25 +1852,19 @@ class MainActivity : AppCompatActivity() {
             val d = duration(formats)
             d > 20.0 && (expectedDuration !in 1.0..12.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0))
         }
-
+        var rejectedByContentFilter = 0
         val usable = groups.mapNotNull { (item, formats) ->
             val requiresNetworkDurationProof = item.origin == "network-pending-ad"
             val isPredeclaredPlayerSource = item.origin == "dom-preroll"
             val checkedFormats = formats.filter { format ->
                 val d = format.durSec.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
                 val rank = qualityRank(format.label)
-                when {
-                    // Network requests seen during an ad are ambiguous. Keep them only
-                    // when the media metadata proves they are long-form content.
+                val accepted = when {
                     requiresNetworkDurationProof -> d > 20.0 && when {
                         expectedDuration > 20.0 -> abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
                         expectedDuration in 1.0..12.0 -> d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
                         else -> true
                     }
-                    // A URL explicitly listed by the player's own quality/config object
-                    // is stronger evidence than an arbitrary ad-period network request.
-                    // If duration metadata is unavailable, accept it only when its URL or
-                    // player label exposes a concrete quality and it is not the ad currentSrc.
                     isPredeclaredPlayerSource -> item.url != currentSrc && (
                         (d > 20.0 && (expectedDuration <= 20.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12))) ||
                             (d <= 0.0 && rank > 0)
@@ -1812,33 +1879,38 @@ class MainActivity : AppCompatActivity() {
                     expectedDuration <= 0.0 && longest > 20.0 -> d <= 0.0 || d >= maxOf(20.0, longest * 0.35)
                     else -> true
                 }
+                if (!accepted) rejectedByContentFilter++
+                accepted
             }
             if (checkedFormats.isEmpty()) null else item to checkedFormats
         }
 
-
-        if (usable.isEmpty()) return emptyList()
-        // اجمع تمثيلات الجودة من جميع المصادر المرتبطة بمشغل الفيديو.
-        // لا تختَر مجموعة HLS واحدة وتُسقط بقية روابط MP4/WEBM المنفصلة؛ بعض المواقع
-        // تعرض master منخفضًا بينما تحفظ 480p/720p/1080p في مصادر مستقلة.
-        val allFormats = usable.flatMap { it.second }
-            .filter { format ->
-                !format.isAudio && !Formats.isAudio(format.ext) && !isExcludedMediaUrl(format.url) &&
-                    (format.kind == "hls" || Util.kindOf("x." + format.ext) == "video")
+        val collected = usable.flatMap { it.second }.filter { format ->
+            !format.isAudio && !Formats.isAudio(format.ext) && !isExcludedMediaUrl(format.url) &&
+                (format.kind == "hls" || Util.kindOf("x." + format.ext) == "video")
+        }
+        // Keep different representations at the same height (AVC/HEVC, HDR/SDR, fps, bitrate).
+        // Merge exact duplicate URLs only; height-only deduplication used to hide valid choices.
+        val byUrl = LinkedHashMap<String, Format>()
+        for (format in collected) {
+            val existing = byUrl[format.url]
+            if (existing == null) {
+                byUrl[format.url] = format
+            } else {
+                val existingScore = listOf(existing.codec.isNotBlank(), existing.dynamicRange.isNotBlank(), existing.frameRate > 0.0, existing.bandwidth > 0L, existing.bytes > 0L).count { it }
+                val newScore = listOf(format.codec.isNotBlank(), format.dynamicRange.isNotBlank(), format.frameRate > 0.0, format.bandwidth > 0L, format.bytes > 0L).count { it }
+                if (newScore > existingScore || (newScore == existingScore && format.bytes > existing.bytes)) byUrl[format.url] = format
             }
-            .distinctBy { it.url }
-        // عند وجود أكثر من URL لنفس الدقة، احتفظ بأعلى تمثيل مقدّر بالحجم، ولا تحذف دقات أخرى.
-        return allFormats
-            .groupBy { format ->
-                val rank = qualityRank(format.label)
-                if (rank > 0) "height:$rank" else "url:${format.url}"
-            }
-            .values
-            .mapNotNull { candidates -> candidates.maxWithOrNull(
-                compareBy<Format> { if (it.bytes > 0) it.bytes else -1L }
-                    .thenBy { if (it.fromMaster) 1 else 0 }
-            ) }
-            .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
+        }
+        val sorted = byUrl.values.sortedWith(
+            compareByDescending<Format> { qualityRank(it.label) }
+                .thenByDescending { it.frameRate }
+                .thenByDescending { it.bandwidth }
+                .thenByDescending { it.bytes }
+                .thenBy { it.codec }
+                .thenBy { it.url }
+        )
+        return ResolveOutcome(sorted, candidates.size, groups.size, emptySources, rejectedByContentFilter, failures)
     }
 
     private fun scheduleBackgroundResolve(t: Tab) {
@@ -1860,20 +1932,28 @@ class MainActivity : AppCompatActivity() {
             if (blockedAsAd && item.origin == "dom") {
                 MediaItem(item.url, item.type, "dom-preroll", item.videoId, item.sourceEpoch,
                     item.qualityHint, item.widthHint, item.heightHint, item.mimeHint,
-                    item.requestHeaders, item.captureSource)
+                    item.requestHeaders, item.captureSource, item.codecHint, item.frameRateHint,
+                    item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint)
             } else item
         }.sortedWith(compareBy<MediaItem> { if (it.origin == "dom" || it.origin == "dom-preroll") 0 else 1 }
             .thenBy { if (it.type == "hls") 0 else 1 })
-            .take(96)
+            .take(48)
         val headers = headersFor(t)
+        t.lastResolveCandidateCount = items.size
+        t.lastResolveReport = "بدأ تحليل ${items.size} مصدرًا..."
         t.resolvingKey = key
         io.execute {
-            val resolved = resolveQualityGroups(items, headers, expectedDuration, blockedAsAd, currentSrc)
+            val outcome = try {
+                resolveQualityGroups(items, headers, expectedDuration, blockedAsAd, currentSrc)
+            } catch (e: Exception) {
+                ResolveOutcome(emptyList(), items.size, 0, 0, 0, listOf(shortResolveError(e)))
+            }
             ui.post {
                 if (tabs.any { it === t } && t.primaryVideoId == videoId &&
                     t.primarySourceEpoch == epoch && resolutionKey(t) == key) {
-                    t.resolvedFormats = resolved
+                    t.resolvedFormats = outcome.formats
                     t.resolvedKey = key
+                    t.lastResolveReport = outcome.summary()
                 }
                 if (t.resolvingKey == key) t.resolvingKey = ""
                 if (cur === t) updateFab()
@@ -1891,6 +1971,11 @@ class MainActivity : AppCompatActivity() {
         val width = meta?.optInt("width", 0)?.takeIf { it > 0 } ?: previous?.widthHint ?: 0
         val height = meta?.optInt("height", 0)?.takeIf { it > 0 } ?: previous?.heightHint ?: 0
         val mime = meta?.optString("mime")?.takeIf { it.isNotBlank() } ?: previous?.mimeHint.orEmpty()
+        val codec = meta?.optString("codec")?.takeIf { it.isNotBlank() } ?: previous?.codecHint.orEmpty()
+        val frameRate = meta?.optDouble("frameRate", 0.0)?.takeIf { it > 0.0 } ?: previous?.frameRateHint ?: 0.0
+        val dynamicRange = meta?.optString("dynamicRange")?.takeIf { it.isNotBlank() } ?: previous?.dynamicRangeHint.orEmpty()
+        val bandwidth = meta?.optLong("bandwidth", 0L)?.takeIf { it > 0L } ?: previous?.bandwidthHint ?: 0L
+        val representationId = meta?.optString("representationId")?.takeIf { it.isNotBlank() } ?: previous?.representationIdHint.orEmpty()
         val requestHeaderObject = meta?.optJSONObject("requestHeaders")
         val requestHeaderMap = LinkedHashMap<String, String>()
         if (requestHeaderObject != null) {
@@ -1907,7 +1992,7 @@ class MainActivity : AppCompatActivity() {
             url, type, origin, videoId, t.primarySourceEpoch,
             quality, width, height, mime,
             CaptureHeaders.merge(previous?.requestHeaders.orEmpty(), safeRequestHeaders),
-            captureSource
+            captureSource, codec, frameRate, dynamicRange, bandwidth, representationId
         )
     }
 
@@ -2249,17 +2334,46 @@ class MainActivity : AppCompatActivity() {
         return CaptureHeaders.safeRequestHeaders(m)
     }
 
+    private fun showDiscoveryDiagnostics(t: Tab, heading: String) {
+        val kinds = t.media.values.groupingBy { it.captureSource.ifBlank { it.origin } }.eachCount()
+        val message = buildString {
+            append(heading).append("\n\n")
+            append("هوية الفيديو الرئيسي: ").append(if (t.primaryVideoId.isNullOrBlank()) "غير محددة" else "محددة").append("\n")
+            append("مصادر DOM/API المحضّرة: ").append(t.preparedMedia.size).append("\n")
+            append("مصادر الشبكة المرتبطة: ").append(t.sniffed.size).append("\n")
+            append("طلبات تنتظر ربطها بالفيديو: ").append(t.pageRequests.size).append("\n")
+            append("سياقات طلبات محفوظة: ").append(t.requestContexts.size).append("\n")
+            append("رسائل API من الإطارات: ").append(t.frameApiPayloads.size).append("\n")
+            append("مصادر Resolver الحالية: ").append(t.media.size).append("\n")
+            append("مصادر ضمن آخر محاولة تحليل: ").append(t.lastResolveCandidateCount).append("\n")
+            append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" })
+            if (t.lastResolveReport.isNotBlank()) append("\n\nتقرير التحليل:\n").append(t.lastResolveReport)
+            append("\n\nالبيانات لا تتضمن روابط موقّعة أو Cookies أو Authorization.")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("تشخيص اكتشاف الصيغ")
+            .setMessage(message)
+            .setPositiveButton("نسخ التشخيص") { _, _ ->
+                (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                    .setPrimaryClip(ClipData.newPlainText("VideoBrowser diagnostics", message))
+                toast("تم نسخ التشخيص؛ أرسله هنا")
+            }
+            .setNegativeButton("إغلاق", null)
+            .show()
+    }
+
     private fun onFabClick() {
         val t = cur ?: return
         val videoId = t.primaryVideoId
         if (videoId == null || t.media.isEmpty()) {
             val message = when {
-                t.primaryIsAd -> "المشغل يعرض إعلانًا؛ لن نعرض روابطه. انتظر انتقاله إلى المحتوى الرئيسي"
-                t.suspectedPreroll -> "المصدر الحالي قصير وغير معروف وقد يكون إعلانًا؛ انتظر بدء الفيديو الرئيسي"
-                t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE؛ انتظر كشف قائمة المحتوى أو بدء تشغيله"
-                else -> "لم تُكتشف مصادر الفيديو الرئيسي بعد؛ انتظر اكتمال تهيئة المشغل"
+                t.primaryIsAd -> "المشغل يعرض إعلانًا؛ لن نعرض روابطه الآن"
+                t.suspectedPreroll -> "المصدر الحالي قصير وغير معروف وقد يكون إعلانًا"
+                t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE ولم تُكشف قائمة المحتوى بعد"
+                else -> "لم تُكتشف مصادر الفيديو الرئيسي بعد"
             }
-            toast(message)
+            showDiscoveryDiagnostics(t, message)
+            scan(t)
             return
         }
 
@@ -2277,7 +2391,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (t.resolvedKey == key && cached.isNullOrEmpty()) {
-            toast("لم أتمكن من استخراج جودات الفيديو الرئيسي؛ قد يكون المصدر غير مكشوف أو محميًا")
+            showDiscoveryDiagnostics(t, "تم التقاط مصادر، لكن لم ينتج عنها أي خيار تنزيل صالح.")
             return
         }
         scheduleBackgroundResolve(t)
@@ -2465,6 +2579,18 @@ class MainActivity : AppCompatActivity() {
             rows++
             val rb = RadioButton(this).apply { isClickable = false; isFocusable = false; buttonTintList = tint }
             val lbl = TextView(this).apply { text = f.label; textSize = 16f; setTextColor(Color.BLACK) }
+            val detail = TextView(this).apply {
+                text = f.details
+                textSize = 10f
+                setTextColor(gray)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+            val labelColumn = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(lbl)
+                if (f.details.isNotBlank()) addView(detail)
+            }
             val sz = TextView(this).apply { text = f.sizeText; textSize = 14f; setTextColor(gray) }
             val r = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -2474,14 +2600,14 @@ class MainActivity : AppCompatActivity() {
                 setOnClickListener { select(f) }
             }
             r.addView(rb)
-            r.addView(lbl, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
+            r.addView(labelColumn, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
             if (f.kind == "direct" && !f.isAudio) {
                 r.addView(TextView(this).apply { text = f.ext.uppercase(); textSize = 12f; setTextColor(gray) },
                     LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(14) })
             }
             r.addView(sz)
             rowsRef.add(RowRef(rb, lbl, sz, f))
-            box.addView(r, LinearLayout.LayoutParams(MATCH, dp(48)))
+            box.addView(r, LinearLayout.LayoutParams(MATCH, dp(56)))
             box.addView(View(this).apply { setBackgroundColor(0xFFF1F3F4.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
         }
         val audio = list.filter { it.isAudio || Formats.isAudio(it.ext) }
@@ -2505,7 +2631,7 @@ class MainActivity : AppCompatActivity() {
         val sv = ScrollView(this)
         sv.addView(box)
         val maxH = (resources.displayMetrics.heightPixels * 0.40).toInt()
-        val wantH = rows * dp(50) + sections * dp(44) + dp(8)
+        val wantH = rows * dp(58) + sections * dp(44) + dp(8)
         root.addView(sv, LinearLayout.LayoutParams(MATCH, minOf(wantH, maxH)))
 
         // ---- الأزرار: تشغيل + تحميل

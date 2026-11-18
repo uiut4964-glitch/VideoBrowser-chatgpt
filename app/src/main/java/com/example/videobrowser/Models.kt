@@ -16,7 +16,12 @@ class MediaItem(
     val heightHint: Int = 0,
     val mimeHint: String = "",
     val requestHeaders: Map<String, String> = emptyMap(),
-    val captureSource: String = ""
+    val captureSource: String = "",
+    val codecHint: String = "",
+    val frameRateHint: Double = 0.0,
+    val dynamicRangeHint: String = "",
+    val bandwidthHint: Long = 0L,
+    val representationIdHint: String = ""
 )
 
 class Format(
@@ -30,7 +35,12 @@ class Format(
     val isAudio: Boolean = false,
     val durSec: Double = 0.0,
     val bytes: Long = -1L,
-    val requestHeaders: Map<String, String> = emptyMap()
+    val requestHeaders: Map<String, String> = emptyMap(),
+    val codec: String = "",
+    val frameRate: Double = 0.0,
+    val dynamicRange: String = "",
+    val bandwidth: Long = 0L,
+    val representationId: String = ""
 )
 
 object St {

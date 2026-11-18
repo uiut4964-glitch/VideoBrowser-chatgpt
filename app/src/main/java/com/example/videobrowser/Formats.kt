@@ -241,9 +241,17 @@ object Formats {
                 if (variant.resolution.isNotBlank()) add(variant.resolution)
                 if (variant.frameRate > 0.0) add(String.format(Locale.US, "%.0f fps", variant.frameRate))
                 if (variant.codecs.isNotBlank()) add(variant.codecs)
+                if (variant.videoRange.isNotBlank() && !variant.videoRange.equals("SDR", true)) add(variant.videoRange)
+                if (bandwidth > 0L) add(String.format(Locale.US, "%.2f Mbps", bandwidth / 1_000_000.0))
             }.joinToString(" • ")
             val ext = if (media.init != null) "mp4" else "ts"
-            out.add(Format(label, details, variant.url, "hls", ext, true, fmtEst(estimatedBytes), false, duration, estimatedBytes, sourceHeaders))
+            out.add(
+                Format(
+                    label, details, variant.url, "hls", ext, true, fmtEst(estimatedBytes), false,
+                    duration, estimatedBytes, sourceHeaders, variant.codecs, variant.frameRate,
+                    variant.videoRange, bandwidth, variant.name
+                )
+            )
         }
 
         for (audio in Hls.parseAudio(masterText, masterUrl).filterNot { isAdUrl(it.url) || isPreviewUrl(it.url) }.take(3)) {
@@ -263,17 +271,17 @@ object Formats {
         val out = ArrayList<Format>()
         if (isAdUrl(item.url) || isPreviewUrl(item.url)) return out
         val sourceHeaders = CaptureHeaders.merge(h, item.requestHeaders)
-
-        // بعض المواقع تقدّم master playlist عبر endpoint لا ينتهي بـ .m3u8.
-        // افحص MIME من HEAD/Range probe قبل افتراض أن كل URL بلا امتداد ملف مباشر.
-        val probe = if (item.type == "hls") null else Net.probe(item.url, sourceHeaders)
-        val probeMime = probe?.mime.orEmpty().lowercase(Locale.ROOT)
         val uriPath = try { java.net.URI(item.url).rawPath.orEmpty().lowercase(Locale.ROOT) } catch (_: Exception) { "" }
-        val hlsByMime = probeMime.contains("mpegurl") || probeMime.contains("m3u8")
-        val hlsByPathHint = uriPath.contains("/hls/") || uriPath.contains("/playlist") || uriPath.contains("/manifest.m3u8")
-        val isHls = item.type == "hls" || hlsByMime || hlsByPathHint
+        val mimeHint = item.mimeHint.lowercase(Locale.ROOT)
+        val pathExt = uriPath.substringAfterLast('.', "")
+        val pathLooksVideo = pathExt in setOf("mp4", "m4v", "webm", "mkv", "mov", "flv", "3gp")
+        val explicitHls = item.type == "hls" || mimeHint.contains("mpegurl") || mimeHint.contains("m3u8") ||
+            uriPath.endsWith(".m3u8") || uriPath.contains("/hls/") || uriPath.contains("/playlist") ||
+            uriPath.endsWith("/manifest")
+        val explicitDash = mimeHint.contains("dash+xml") || uriPath.endsWith(".mpd")
+        if (explicitDash) throw IOException("المصدر يستخدم MPEG-DASH (MPD)، واستخراج تمثيلاته وتنزيلها يحتاج مسار DASH مستقلًا")
 
-        if (isHls) {
+        if (explicitHls) {
             val text = Net.fetchText(item.url, sourceHeaders)
             if (!text.trimStart().startsWith("#EXTM3U")) throw IOException("مصدر HLS لا يحتوي قائمة M3U8 صالحة")
             if (Hls.isMaster(text)) {
@@ -284,54 +292,93 @@ object Formats {
                 val label = if (inf.h > 0) qualityLabel(inf.w, inf.h)
                 else if (inf.bytes > 0 && inf.duration > 0)
                     "جودة " + String.format(Locale.US, "%.1f Mbps", inf.bytes * 8 / inf.duration / 1_000_000.0)
-                else "جودة غير معروفة"
+                else item.qualityHint.takeIf { it.isNotBlank() } ?: "جودة غير معروفة"
                 out.add(
                     Format(
                         label, if (inf.w > 0 && inf.h > 0) "${inf.w}x${inf.h}" else "", item.url, "hls",
-                        if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration, inf.bytes, sourceHeaders
+                        if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false,
+                        inf.duration, inf.bytes, sourceHeaders, item.codecHint, item.frameRateHint,
+                        item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint
                     )
                 )
             }
-        } else {
-            val p = probe ?: Net.probe(item.url, sourceHeaders)
-            // DASH MPD ليس ملف فيديو مباشرًا؛ لا تعرضه كـ MP4 لأن ذلك سينزّل XML بدل الفيديو.
-            if (probeMime.contains("dash+xml") || uriPath.endsWith(".mpd")) {
-                throw IOException("المصدر يستخدم MPEG-DASH (MPD)، واستخراج تمثيلاته وتنزيلها يحتاج مسار DASH مستقلًا")
-            }
-            val hasTrustedVideoMetadata = item.heightHint > 0 || item.qualityHint.isNotBlank() ||
-                item.mimeHint.startsWith("video/", true)
-            if ((p.mime.startsWith("text/") && !(hasTrustedVideoMetadata && !p.mime.contains("html") && !p.mime.contains("xml"))) ||
-                p.mime.startsWith("image/") || p.mime.contains("json") || p.mime.contains("html") || p.mime.contains("xml")
-            ) return out
-            if (p.total in 1L..30000L) return out
-            // Prefer MIME/quality information from the player's own manifest/config.
-            // Signed CDN URLs often have opaque paths and reveal neither extension nor
-            // resolution in their URL; dropping this metadata made every rendition appear
-            // as the same "original quality" or allowed only the first low-quality source.
-            val declaredMime = item.mimeHint.takeIf { it.isNotBlank() } ?: p.mime
-            val ext = extOf(item.url, declaredMime)
-            val q = qualityFromUrl(item.url)
-                ?: item.heightHint.takeIf { it in 144..4320 }
-                ?: qualityFromLabel(item.qualityHint)
-            val needRemoteInfo = item.origin == "network-pending-ad" || item.origin == "dom-preroll" ||
-                (q == null && (item.widthHint <= 0 || item.heightHint <= 0))
-            val remoteInfo = if (needRemoteInfo) remoteVideoInfo(item.url, sourceHeaders) else null
-            val audio = isAudio(ext) || p.mime.startsWith("audio/", true) || item.mimeHint.startsWith("audio/", true)
-            val width = remoteInfo?.w?.takeIf { it > 0 } ?: item.widthHint
-            val height = remoteInfo?.h?.takeIf { it > 0 } ?: item.heightHint.takeIf { it > 0 } ?: (q ?: 0)
-            val label = when {
-                audio -> ext.uppercase()
-                height > 0 -> qualityLabel(width.takeIf { it > 0 } ?: (height * 16 / 9), height)
-                item.qualityHint.isNotBlank() -> item.qualityHint
-                q != null -> qualityLabel(q * 16 / 9, q)
-                else -> "الجودة الأصلية"
-            }
-            val d = ArrayList<String>()
-            d.add(Util.host(item.url))
-            if (width > 0 && height > 0) d.add("${width}x${height}")
-            d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
-            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, fmtEst(p.total), audio, remoteInfo?.duration ?: 0.0, p.total, sourceHeaders))
+            return out
         }
+
+        // A failed Range probe must not erase a player-declared rendition. Some CDNs
+        // reject bytes=0-0 or return 206 with an unknown total even though GET works.
+        // We still require a strong player/URL video signal before accepting probe failure.
+        val trustedVideoMetadata = item.heightHint in 144..4320 || item.widthHint > 0 ||
+            item.qualityHint.isNotBlank() || mimeHint.startsWith("video/") || pathLooksVideo
+        val probe = try {
+            Net.probe(item.url, sourceHeaders)
+        } catch (e: Exception) {
+            if (!trustedVideoMetadata) throw e
+            null
+        }
+        val probeMime = probe?.mime.orEmpty().lowercase(Locale.ROOT)
+        if (probeMime.contains("dash+xml")) throw IOException("المصدر يستخدم MPEG-DASH (MPD)، واستخراج تمثيلاته يحتاج مسار DASH مستقلًا")
+        if (probeMime.contains("mpegurl") || probeMime.contains("m3u8")) {
+            val text = Net.fetchText(item.url, sourceHeaders)
+            if (!text.trimStart().startsWith("#EXTM3U")) throw IOException("الخادم أعلن HLS لكن الاستجابة ليست قائمة M3U8")
+            if (Hls.isMaster(text)) resolveHlsMaster(item.url, text, sourceHeaders, out, LinkedHashSet(), 0, sourceHeaders)
+            else {
+                val inf = mediaInfo(item.url, sourceHeaders, true)
+                val media = Hls.parseMedia(text, item.url)
+                out.add(Format(
+                    item.qualityHint.ifBlank { if (inf.h > 0) qualityLabel(inf.w, inf.h) else "جودة غير معروفة" },
+                    if (inf.w > 0 && inf.h > 0) "${inf.w}x${inf.h}" else "", item.url, "hls",
+                    if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false,
+                    inf.duration, inf.bytes, sourceHeaders, item.codecHint, item.frameRateHint,
+                    item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint
+                ))
+            }
+            return out
+        }
+
+        val mime = (mimeHint.takeIf { it.isNotBlank() } ?: probeMime).lowercase(Locale.ROOT)
+        // Do not mistake HTML/JSON/image responses for video, even when a player object
+        // contained a URL. An explicit video MIME/quality is accepted only if the probe
+        // did not positively identify a non-video response.
+        if (mime.startsWith("text/html") || mime.contains("json") || mime.contains("xml") || mime.startsWith("image/")) return out
+        if (probeMime.startsWith("text/") || probeMime.startsWith("image/") || probeMime.contains("json") ||
+            probeMime.contains("html") || probeMime.contains("xml")) return out
+        val total = probe?.total ?: -1L
+        if (total in 1L..30_000L && !trustedVideoMetadata) return out
+
+        val declaredMime = item.mimeHint.takeIf { it.isNotBlank() } ?: probeMime
+        val ext = extOf(item.url, declaredMime)
+        val q = qualityFromUrl(item.url)
+            ?: item.heightHint.takeIf { it in 144..4320 }
+            ?: qualityFromLabel(item.qualityHint)
+        val needRemoteInfo = item.origin == "network-pending-ad" || item.origin == "dom-preroll"
+        val remoteInfo = if (needRemoteInfo) remoteVideoInfo(item.url, sourceHeaders) else null
+        val audio = isAudio(ext) || mime.startsWith("audio/")
+        val width = remoteInfo?.w?.takeIf { it > 0 } ?: item.widthHint
+        val height = remoteInfo?.h?.takeIf { it > 0 } ?: item.heightHint.takeIf { it > 0 } ?: (q ?: 0)
+        val label = when {
+            audio -> ext.uppercase()
+            height > 0 -> qualityLabel(width.takeIf { it > 0 } ?: (height * 16 / 9), height)
+            item.qualityHint.isNotBlank() -> item.qualityHint
+            q != null -> qualityLabel(q * 16 / 9, q)
+            else -> "الجودة الأصلية"
+        }
+        val details = buildList {
+            add(Util.host(item.url))
+            if (width > 0 && height > 0) add("${width}x${height}")
+            if (item.codecHint.isNotBlank()) add(item.codecHint)
+            if (item.frameRateHint > 0.0) add(String.format(Locale.US, "%.0f fps", item.frameRateHint))
+            if (item.dynamicRangeHint.isNotBlank()) add(item.dynamicRangeHint)
+            if (item.bandwidthHint > 0L) add(String.format(Locale.US, "%.2f Mbps", item.bandwidthHint / 1_000_000.0))
+            add(if (probe?.rangeOk == true) "يدعم التجزئة والاستئناف" else "بدون معلومات Range؛ سيتم فحصه عند التنزيل")
+        }.joinToString(" • ")
+        out.add(
+            Format(
+                label, details, item.url, "direct", ext, false, fmtEst(total), audio,
+                remoteInfo?.duration ?: 0.0, total, sourceHeaders, item.codecHint,
+                item.frameRateHint, item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint
+            )
+        )
         return out
     }
 }

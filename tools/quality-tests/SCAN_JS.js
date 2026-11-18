@@ -107,7 +107,17 @@
         if (w > 0 && w < 10000) meta.width = w;
         if (h > 0 && h < 10000) meta.height = h;
         var mime = raw.mimeType || raw.mime_type || raw.contentType || raw.content_type || raw.type || '';
-        if (mime && /^(video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl)|audio\/)/i.test(String(mime))) meta.mime = String(mime);
+        if (mime && /^(video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|audio\/)/i.test(String(mime))) meta.mime = String(mime);
+        var codec = raw.codecs || raw.codec || raw.videoCodec || raw.video_codec || raw.videoCodecName || '';
+        if (codec) meta.codec = String(codec).slice(0, 160);
+        var fps = Number(raw.frameRate || raw.frame_rate || raw.fps || raw.frameRateHint || 0);
+        if (fps > 0 && fps <= 240) meta.frameRate = fps;
+        var range = raw.videoRange || raw.video_range || raw.dynamicRange || raw.hdr || raw.colorSpace || '';
+        if (range) meta.dynamicRange = String(range).slice(0, 80);
+        var bandwidth = Number(raw.averageBandwidth || raw.average_bandwidth || raw.bandwidth || raw.bitrate || 0);
+        if (bandwidth > 0 && bandwidth < 1000000000) meta.bandwidth = bandwidth;
+        var representationId = raw.representationId || raw.representation_id || raw.formatId || raw.itag || raw.id || '';
+        if (representationId !== '') meta.representationId = String(representationId).slice(0, 120);
       }
       if (keyHint) {
         var key = String(keyHint).trim();
@@ -202,6 +212,11 @@
         if (incoming.width && !existing.width) existing.width = incoming.width;
         if (incoming.height && !existing.height) existing.height = incoming.height;
         if (incoming.mime && !existing.mime) existing.mime = incoming.mime;
+        if (incoming.codec && !existing.codec) existing.codec = incoming.codec;
+        if (incoming.frameRate && !existing.frameRate) existing.frameRate = incoming.frameRate;
+        if (incoming.dynamicRange && !existing.dynamicRange) existing.dynamicRange = incoming.dynamicRange;
+        if (incoming.bandwidth && !existing.bandwidth) existing.bandwidth = incoming.bandwidth;
+        if (incoming.representationId && !existing.representationId) existing.representationId = incoming.representationId;
         if (activeApiContext) {
           if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
             existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
