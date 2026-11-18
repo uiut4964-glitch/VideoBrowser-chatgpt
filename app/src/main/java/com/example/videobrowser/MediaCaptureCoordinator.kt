@@ -30,7 +30,7 @@ object MediaCaptureCoordinator {
                             fallbackPageUrl = "",
                             source = "service-worker",
                             isMainFrame = request.isForMainFrame,
-                            hasGesture = request.hasGesture
+                            hasGesture = request.hasGesture()
                         )
                         if (captured.method == "GET") activeListener?.invoke(captured)
                     } catch (_: Exception) {

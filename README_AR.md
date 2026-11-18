@@ -6,6 +6,16 @@
 **المنصة:** Android / Kotlin  
 **مشغل الوسائط:** AndroidX Media3 `1.11.1`
 
+## إصلاح بناء 1.10.1 (مقابل خطأ CI)
+
+أصلحت النسخة 1.10.1 خطأ Kotlin في استدعاء `WebResourceRequest.hasGesture()`: كانت النسخة السابقة تستخدم `hasGesture` دون أقواس في موضعين، فكان المترجم يعرض `Function invocation 'hasGesture()' expected`. تم تصحيح الاستدعاء في `MainActivity.kt` و`MediaCaptureCoordinator.kt`.
+
+لم تتغير منطقية الالتقاط أو الترويسات أو `DownloadCenter.kt` أو `Hls.kt` بسبب هذا الإصلاح. تم تحديث `versionName` إلى `1.10.1` و`versionCode` إلى `12`.
+
+**التحقق بعد الإصلاح:** نجحت اختبارات JavaScript الستة، واختبارات Kotlin الأربعة، وتجميع `ApiCaptureScript.kt` باستخدام Kotlin compiler. لم يُنفّذ `gradle assembleDebug` في بيئة إعداد هذه الحزمة لعدم توفر Android SDK وGradle؛ لذلك يجب اعتبار بناء APK الكامل بانتظار تشغيل CI بعد هذا التصحيح.
+
+---
+
 هذه النسخة ناتجة عن مقارنة ودمج ثلاثة مصادر:
 
 1. `VideoBrowser-main.zip` — الأساس الوظيفي للمشروع.

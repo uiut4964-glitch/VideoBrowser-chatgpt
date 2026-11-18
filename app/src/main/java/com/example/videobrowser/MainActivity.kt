@@ -1510,7 +1510,7 @@ class MainActivity : AppCompatActivity() {
                         fallbackPageUrl = tab.url,
                         source = "webview",
                         isMainFrame = r.isForMainFrame,
-                        hasGesture = r.hasGesture
+                        hasGesture = r.hasGesture()
                     )
                     ui.post { rec(tab, captured) }
                 }
