@@ -777,7 +777,8 @@ class MainActivity : AppCompatActivity() {
         val requestedAt: Long,
         val videoId: String,
         val sourceEpoch: Int,
-        val capturedDuringAd: Boolean = false
+        val capturedDuringAd: Boolean = false,
+        val request: CapturedMediaRequest? = null
     )
 
     private class Tab(val web: WebView) {
@@ -789,6 +790,8 @@ class MainActivity : AppCompatActivity() {
         val media = LinkedHashMap<String, MediaItem>()
         val preparedMedia = LinkedHashMap<String, MediaItem>()
         val sniffed = LinkedHashMap<String, SniffedMedia>()
+        // Full, non-secret request context is held only in memory for the current page session.
+        val requestContexts = LinkedHashMap<String, CapturedMediaRequest>()
         // طلبات مرشحة ظهرت أثناء إعلان ما قبل التشغيل؛ لا تُعرض للمستخدم إلا بعد انتقال المصدر إلى المحتوى.
         val pendingSniffed = LinkedHashMap<String, Long>()
         // طلبات وسائط التقطت قبل أن ينتهي فحص DOM من تحديد عنصر الفيديو الرئيسي.
@@ -949,10 +952,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        MediaCaptureCoordinator.attach(this) { request ->
+            ui.post { captureServiceWorkerRequest(request) }
+        }
         ui.post(scanLoop)
     }
 
     override fun onPause() {
+        MediaCaptureCoordinator.detach(this)
         ui.removeCallbacks(scanLoop)
         cur?.let {
             it.activePlayback = false
@@ -969,6 +976,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        MediaCaptureCoordinator.detach(this)
         ui.removeCallbacksAndMessages(null)
         content.removeAllViews()
         tabs.forEach { it.web.destroy() }
@@ -1171,6 +1179,7 @@ class MainActivity : AppCompatActivity() {
         t.media.clear()
         t.preparedMedia.clear()
         t.sniffed.clear()
+        t.requestContexts.clear()
         t.pendingSniffed.clear()
         t.pageRequests.clear()
         t.resolvedFormats = null
@@ -1278,10 +1287,19 @@ class MainActivity : AppCompatActivity() {
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
-                // نخزن الطلبات المرشحة داخليًا فقط إذا أمكن ربطها لاحقًا بعنصر الفيديو الرئيسي.
-                // لا يظهر أي عداد أو رابط خام للمستخدم، وتُرفض الإعلانات والمعاينات والمقاطع الجزئية.
-                if (!r.isForMainFrame && isCandidateMediaRequest(u)) {
-                    ui.post { rec(tab, u) }
+                // Snapshot only allowlisted request headers while still on the request callback.
+                // This callback is passive: returning null lets WebView perform the original request.
+                if (!r.isForMainFrame && r.method.equals("GET", true) && isCandidateMediaRequest(u)) {
+                    val captured = MediaCaptureCoordinator.snapshot(
+                        url = u,
+                        method = r.method,
+                        requestHeaders = r.requestHeaders,
+                        fallbackPageUrl = tab.url,
+                        source = "webview",
+                        isMainFrame = r.isForMainFrame,
+                        hasGesture = r.hasGesture
+                    )
+                    ui.post { rec(tab, captured) }
                 }
                 return null
             }
@@ -1331,6 +1349,26 @@ class MainActivity : AppCompatActivity() {
         customCb?.onCustomViewHidden()
         customCb = null
         WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun captureServiceWorkerRequest(request: CapturedMediaRequest) {
+        if (request.method != "GET" || request.isMainFrame || !isCandidateMediaRequest(request.url)) return
+        val page = request.pageUrl
+        val pageUri = try { Uri.parse(page) } catch (_: Exception) { null }
+        val pageHost = pageUri?.host?.lowercase()
+        val matches = if (!pageHost.isNullOrBlank()) tabs.filter {
+            try { Uri.parse(it.url).host?.equals(pageHost, true) == true } catch (_: Exception) { false }
+        } else emptyList()
+        val exactMatches = if (pageUri != null && !pageUri.path.isNullOrBlank()) matches.filter {
+            try { Uri.parse(it.url).path == pageUri.path } catch (_: Exception) { false }
+        } else emptyList()
+        val tab = when {
+            exactMatches.size == 1 -> exactMatches.first()
+            matches.size == 1 -> matches.first()
+            tabs.size == 1 && page.isBlank() -> tabs.first()
+            else -> null // Do not assign an ambiguous Service Worker request to the wrong tab.
+        } ?: return
+        rec(tab, request)
     }
 
     private fun addHistory(title: String, url: String) {
@@ -1424,6 +1462,7 @@ class MainActivity : AppCompatActivity() {
         t.media.clear()
         t.preparedMedia.clear()
         t.sniffed.clear()
+        t.requestContexts.clear()
         t.pendingSniffed.clear()
         t.pageRequests.clear()
         t.primaryVideoId = null
@@ -1473,7 +1512,12 @@ class MainActivity : AppCompatActivity() {
                             prepared?.qualityHint.orEmpty(),
                             prepared?.widthHint ?: 0,
                             prepared?.heightHint ?: 0,
-                            prepared?.mimeHint.orEmpty()
+                            prepared?.mimeHint.orEmpty(),
+                            CaptureHeaders.merge(
+                                emptyMap(),
+                                captured.request?.headers.orEmpty()
+                            ),
+                            captured.request?.source.orEmpty()
                         )
                     }
                 }
@@ -1486,7 +1530,12 @@ class MainActivity : AppCompatActivity() {
         val id = t.primaryVideoId.orEmpty()
         val sources = t.media.values
             .sortedBy { it.url }
-            .joinToString("\n") { "${it.origin}|${it.type}|${it.url}|${it.qualityHint}|${it.widthHint}x${it.heightHint}|${it.mimeHint}" }
+            .joinToString("\n") { item ->
+                val headerKey = item.requestHeaders.entries
+                    .sortedBy { header -> header.key.lowercase() }
+                    .joinToString(";") { header -> "${header.key}:${header.value}" }
+                "${item.origin}|${item.type}|${item.url}|${item.qualityHint}|${item.widthHint}x${item.heightHint}|${item.mimeHint}|${item.captureSource}|$headerKey"
+            }
         return "$id|${t.primarySourceEpoch}|${t.primaryCurrentSrc}|${t.primaryIsAd}|${t.suspectedPreroll}|${"%.1f".format(java.util.Locale.US, t.expectedDurationSec)}|$sources"
     }
 
@@ -1638,7 +1687,7 @@ class MainActivity : AppCompatActivity() {
         t.pageRequests.forEach { (url, time) ->
             if (now - time <= 90_000L && isCandidateMediaRequest(url)) {
                 if (isAd) t.pendingSniffed[url] = time
-                else t.sniffed[url] = SniffedMedia(url, time, id, epoch, false)
+                else t.sniffed[url] = SniffedMedia(url, time, id, epoch, false, t.requestContexts[url])
             }
         }
         t.pageRequests.clear()
@@ -1651,7 +1700,7 @@ class MainActivity : AppCompatActivity() {
             // لا نسقط روابط MP4/المصادر المنفصلة التي جهزها المشغل قبل انتهاء الإعلان.
             // يتم التحقق من مدة الملف المباشر ونوعه لاحقًا في Formats.resolve قبل عرضه.
             if (now - time <= 180_000L && isCandidateMediaRequest(url) && !isExcludedMediaUrl(url)) {
-                t.sniffed[url] = SniffedMedia(url, time, id, epoch, true)
+                t.sniffed[url] = SniffedMedia(url, time, id, epoch, true, t.requestContexts[url])
             }
         }
         t.pendingSniffed.clear()
@@ -1723,12 +1772,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun rec(t: Tab, url: String) {
-        if (!isCandidateMediaRequest(url)) return
+    private fun rec(t: Tab, request: CapturedMediaRequest) {
+        val url = request.url
+        if (request.method != "GET" || !isCandidateMediaRequest(url)) return
+        val now = request.capturedAt
+        // Keep only recent, allowlisted request context in memory. Cookies are resolved
+        // from CookieManager later; Authorization/Cookie headers are never copied here.
+        t.requestContexts.remove(url)
+        t.requestContexts[url] = request
+        t.requestContexts.entries.removeAll { now - it.value.capturedAt !in 0L..180_000L }
+        while (t.requestContexts.size > 120) {
+            val oldest = t.requestContexts.keys.firstOrNull() ?: break
+            t.requestContexts.remove(oldest)
+        }
+
         // قد تُطلب قائمة الجودة قبل أن يكتمل أول فحص DOM؛ احتفظ بمرشحات قصيرة العمر
         // حتى نحدد عنصر الفيديو الرئيسي ثم نربطها به بدل إسقاطها.
         val id = t.primaryVideoId
-        val now = System.currentTimeMillis()
         if (id == null) {
             t.pageRequests[url] = now
             t.pageRequests.entries.removeAll { now - it.value !in 0L..90_000L }
@@ -1741,8 +1801,6 @@ class MainActivity : AppCompatActivity() {
         // تُجهّز مصادر مشغل الفيديو الرئيسي منذ تحميل صفحة المشاهدة، حتى قبل ضغط Play.
         // لا يغيّر ذلك لون الزر؛ فالتفعيل الأحمر ما زال يتطلب تشغيلًا فعليًا بدأه المستخدم.
         if (t.primaryIsAd || t.suspectedPreroll) {
-            // لا نعرض مصادر فترة الإعلان/المصدر القصير غير المصنف، لكن نحتفظ مؤقتًا بالطلبات المرشحة
-            // لنربط طلبات المحتوى التي بدأ تحميلها قبل انتقال المشغل من الإعلان إلى الفيلم.
             t.pendingSniffed[url] = now
             t.pendingSniffed.entries.removeAll { now - it.value !in 0L..180_000L }
             while (t.pendingSniffed.size > 100) {
@@ -1751,7 +1809,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        t.sniffed[url] = SniffedMedia(url, now, id, t.primarySourceEpoch)
+        t.sniffed[url] = SniffedMedia(url, now, id, t.primarySourceEpoch, false, request)
         while (t.sniffed.size > 80) {
             val oldest = t.sniffed.keys.firstOrNull() ?: break
             t.sniffed.remove(oldest)
@@ -1803,6 +1861,7 @@ class MainActivity : AppCompatActivity() {
             t.media.clear()
             t.preparedMedia.clear()
             t.sniffed.clear()
+            t.requestContexts.entries.removeAll { System.currentTimeMillis() - it.value.capturedAt > 180_000L }
             t.pendingSniffed.clear()
             t.userGestureVideoIds.removeAll { it != id }
         } else if (sourceChanged) {
@@ -1868,7 +1927,7 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }
-        return m
+        return CaptureHeaders.safeRequestHeaders(m)
     }
 
     private fun onFabClick() {
@@ -2144,7 +2203,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener {
                 val f = selected
-                if (f != null) playPreview(f, headers, et.text.toString())
+                if (f != null) playPreview(f, CaptureHeaders.merge(headers, f.requestHeaders), et.text.toString())
             }
         }
         playBtn = pb
@@ -2163,7 +2222,7 @@ class MainActivity : AppCompatActivity() {
                 val f = selected
                 if (f != null) {
                     dlg.dismiss()
-                    startDownload(f, et.text.toString(), headers, poster)
+                    startDownload(f, et.text.toString(), CaptureHeaders.merge(headers, f.requestHeaders), poster)
                 }
             }
         }, LinearLayout.LayoutParams(0, WRAP, 2f).apply { marginStart = dp(10) })

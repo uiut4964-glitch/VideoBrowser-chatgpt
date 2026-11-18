@@ -20,9 +20,20 @@ fun main() {
             #EXT-X-ENDLIST
         """.trimIndent()
     }
-    val result = Formats.resolve(MediaItem(masterUrl, "hls"), emptyMap())
+    val result = Formats.resolve(
+        MediaItem(masterUrl, "hls", requestHeaders = mapOf(
+            "Referer" to "https://site.example/watch/42",
+            "Accept" to "application/vnd.apple.mpegurl"
+        )),
+        mapOf("User-Agent" to "VideoBrowser-Test-UA")
+    )
     val labels = result.map { it.label }
     check(result.size == 6) { "expected 6 quality variants, got ${result.size}: $labels" }
     heights.forEach { h -> check(labels.any { it.contains("${h}P") }) { "missing ${h}p in $labels" } }
-    println("Formats.resolve test passed: ${labels.joinToString(", ")}")
+    result.forEach { format ->
+        check(format.requestHeaders["Referer"] == "https://site.example/watch/42")
+        check(format.requestHeaders["Accept"] == "application/vnd.apple.mpegurl")
+        check(format.requestHeaders["User-Agent"] == "VideoBrowser-Test-UA")
+    }
+    println("Formats.resolve test passed: ${labels.joinToString(", ")} with request-context headers preserved")
 }

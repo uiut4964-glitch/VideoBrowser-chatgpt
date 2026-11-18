@@ -28,6 +28,7 @@ node QualityMapConfigTest.js
 ```bash
 kotlinc \
   app/src/main/java/com/example/videobrowser/Models.kt \
+  app/src/main/java/com/example/videobrowser/MediaCapture.kt \
   app/src/main/java/com/example/videobrowser/Hls.kt \
   app/src/main/java/com/example/videobrowser/Formats.kt \
   tools/quality-tests/com/example/videobrowser/NetTestSupport.kt \
@@ -36,11 +37,13 @@ kotlinc \
   tools/quality-tests/HlsMasterTest.kt \
   tools/quality-tests/HlsFormatsResolveTest.kt \
   tools/quality-tests/DirectQualityMetadataTest.kt \
+  tools/quality-tests/CaptureHeadersTest.kt \
   -include-runtime -d /tmp/videobrowser-quality-tests.jar
 
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsMasterTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsFormatsResolveTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.DirectQualityMetadataTestKt
+java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.CaptureHeadersTestKt
 ```
 
 `NetTestSupport.kt` وملفات `android/*` بدائل اختبار فقط؛ لا تنقلها إلى `app/src/main`.

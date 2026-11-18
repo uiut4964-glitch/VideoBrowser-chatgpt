@@ -14,7 +14,9 @@ class MediaItem(
     val qualityHint: String = "",
     val widthHint: Int = 0,
     val heightHint: Int = 0,
-    val mimeHint: String = ""
+    val mimeHint: String = "",
+    val requestHeaders: Map<String, String> = emptyMap(),
+    val captureSource: String = ""
 )
 
 class Format(
@@ -27,7 +29,8 @@ class Format(
     val sizeText: String = "",
     val isAudio: Boolean = false,
     val durSec: Double = 0.0,
-    val bytes: Long = -1L
+    val bytes: Long = -1L,
+    val requestHeaders: Map<String, String> = emptyMap()
 )
 
 object St {

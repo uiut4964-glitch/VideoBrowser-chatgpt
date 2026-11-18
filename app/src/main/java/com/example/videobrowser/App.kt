@@ -8,6 +8,7 @@ import java.util.Date
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        MediaCaptureCoordinator.installServiceWorkerClient()
         val old = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             try {

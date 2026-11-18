@@ -191,7 +191,8 @@ object Formats {
         headers: Map<String, String>,
         out: MutableList<Format>,
         visited: MutableSet<String>,
-        depth: Int
+        depth: Int,
+        sourceHeaders: Map<String, String>
     ) {
         if (depth > 4) throw IOException("تجاوز عمق قوائم HLS الرئيسية المتداخلة")
         if (!visited.add(masterUrl)) return
@@ -202,7 +203,7 @@ object Formats {
             if (isAdUrl(variant.url) || isPreviewUrl(variant.url) || variant.url in visited) continue
             val childText = try { Net.fetchText(variant.url, headers) } catch (_: Exception) { continue }
             if (Hls.isMaster(childText)) {
-                resolveHlsMaster(variant.url, childText, headers, out, visited, depth + 1)
+                resolveHlsMaster(variant.url, childText, headers, out, visited, depth + 1, sourceHeaders)
                 continue
             }
             visited.add(variant.url)
@@ -242,7 +243,7 @@ object Formats {
                 if (variant.codecs.isNotBlank()) add(variant.codecs)
             }.joinToString(" • ")
             val ext = if (media.init != null) "mp4" else "ts"
-            out.add(Format(label, details, variant.url, "hls", ext, true, fmtEst(estimatedBytes), false, duration, estimatedBytes))
+            out.add(Format(label, details, variant.url, "hls", ext, true, fmtEst(estimatedBytes), false, duration, estimatedBytes, sourceHeaders))
         }
 
         for (audio in Hls.parseAudio(masterText, masterUrl).filterNot { isAdUrl(it.url) || isPreviewUrl(it.url) }.take(3)) {
@@ -254,17 +255,18 @@ object Formats {
                 estimated = info.bytes
                 audioDuration = info.duration
             } catch (_: Exception) {}
-            out.add(Format("صوت (" + audio.name + ")", "", audio.url, "hls", "ts", true, fmtEst(estimated), true, audioDuration, estimated))
+            out.add(Format("صوت (" + audio.name + ")", "", audio.url, "hls", "ts", true, fmtEst(estimated), true, audioDuration, estimated, sourceHeaders))
         }
     }
 
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
         if (isAdUrl(item.url) || isPreviewUrl(item.url)) return out
+        val sourceHeaders = CaptureHeaders.merge(h, item.requestHeaders)
 
         // بعض المواقع تقدّم master playlist عبر endpoint لا ينتهي بـ .m3u8.
         // افحص MIME من HEAD/Range probe قبل افتراض أن كل URL بلا امتداد ملف مباشر.
-        val probe = if (item.type == "hls") null else Net.probe(item.url, h)
+        val probe = if (item.type == "hls") null else Net.probe(item.url, sourceHeaders)
         val probeMime = probe?.mime.orEmpty().lowercase(Locale.ROOT)
         val uriPath = try { java.net.URI(item.url).rawPath.orEmpty().lowercase(Locale.ROOT) } catch (_: Exception) { "" }
         val hlsByMime = probeMime.contains("mpegurl") || probeMime.contains("m3u8")
@@ -272,12 +274,12 @@ object Formats {
         val isHls = item.type == "hls" || hlsByMime || hlsByPathHint
 
         if (isHls) {
-            val text = Net.fetchText(item.url, h)
+            val text = Net.fetchText(item.url, sourceHeaders)
             if (!text.trimStart().startsWith("#EXTM3U")) throw IOException("مصدر HLS لا يحتوي قائمة M3U8 صالحة")
             if (Hls.isMaster(text)) {
-                resolveHlsMaster(item.url, text, h, out, LinkedHashSet(), 0)
+                resolveHlsMaster(item.url, text, sourceHeaders, out, LinkedHashSet(), 0, sourceHeaders)
             } else {
-                val inf = mediaInfo(item.url, h, true)
+                val inf = mediaInfo(item.url, sourceHeaders, true)
                 val media = Hls.parseMedia(text, item.url)
                 val label = if (inf.h > 0) qualityLabel(inf.w, inf.h)
                 else if (inf.bytes > 0 && inf.duration > 0)
@@ -286,12 +288,12 @@ object Formats {
                 out.add(
                     Format(
                         label, if (inf.w > 0 && inf.h > 0) "${inf.w}x${inf.h}" else "", item.url, "hls",
-                        if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration, inf.bytes
+                        if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration, inf.bytes, sourceHeaders
                     )
                 )
             }
         } else {
-            val p = probe ?: Net.probe(item.url, h)
+            val p = probe ?: Net.probe(item.url, sourceHeaders)
             // DASH MPD ليس ملف فيديو مباشرًا؛ لا تعرضه كـ MP4 لأن ذلك سينزّل XML بدل الفيديو.
             if (probeMime.contains("dash+xml") || uriPath.endsWith(".mpd")) {
                 throw IOException("المصدر يستخدم MPEG-DASH (MPD)، واستخراج تمثيلاته وتنزيلها يحتاج مسار DASH مستقلًا")
@@ -313,7 +315,7 @@ object Formats {
                 ?: qualityFromLabel(item.qualityHint)
             val needRemoteInfo = item.origin == "network-pending-ad" || item.origin == "dom-preroll" ||
                 (q == null && (item.widthHint <= 0 || item.heightHint <= 0))
-            val remoteInfo = if (needRemoteInfo) remoteVideoInfo(item.url, h) else null
+            val remoteInfo = if (needRemoteInfo) remoteVideoInfo(item.url, sourceHeaders) else null
             val audio = isAudio(ext) || p.mime.startsWith("audio/", true) || item.mimeHint.startsWith("audio/", true)
             val width = remoteInfo?.w?.takeIf { it > 0 } ?: item.widthHint
             val height = remoteInfo?.h?.takeIf { it > 0 } ?: item.heightHint.takeIf { it > 0 } ?: (q ?: 0)
@@ -328,7 +330,7 @@ object Formats {
             d.add(Util.host(item.url))
             if (width > 0 && height > 0) d.add("${width}x${height}")
             d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
-            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, fmtEst(p.total), audio, remoteInfo?.duration ?: 0.0, p.total))
+            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, fmtEst(p.total), audio, remoteInfo?.duration ?: 0.0, p.total, sourceHeaders))
         }
         return out
     }
