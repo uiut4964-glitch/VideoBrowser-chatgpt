@@ -187,10 +187,11 @@
         }
       }
     };
-    var collectSources = function(v){
+    var collectSources = function(v, apiOnly){
       var out = [];
       var seen = Object.create(null);
       var sourceMeta = Object.create(null);
+      var activeApiContext = null;
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -201,8 +202,15 @@
         if (incoming.width && !existing.width) existing.width = incoming.width;
         if (incoming.height && !existing.height) existing.height = incoming.height;
         if (incoming.mime && !existing.mime) existing.mime = incoming.mime;
+        if (activeApiContext) {
+          if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
+            existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
+          }
+          if (activeApiContext.source) existing.captureSource = activeApiContext.source;
+        }
         sourceMeta[u] = existing;
       };
+      if (!apiOnly) {
       // 1) إعدادات المحتوى المسبقة على عنصر الفيديو والحاويات القريبة.
       var n = v;
       var playerRoot = v.parentElement || document;
@@ -297,6 +305,7 @@
           });
         }
       } catch (_) {}
+      }
       // 7) Dynamic API payloads: wrap fetch/XHR once and inspect only bounded text/JSON
       // responses that look like player metadata or manifests. Binary media is never read here.
       try {
@@ -386,65 +395,101 @@
         }
         return attrs;
       };
-      var apiPayloads = window.__vbApiPayloads || [];
-      for (var ap = Math.max(0, apiPayloads.length - 24); ap < apiPayloads.length; ap++) {
+      var nativeApiPayloads = (typeof __vbNativeApiPayloads !== 'undefined' && Array.isArray(__vbNativeApiPayloads))
+        ? __vbNativeApiPayloads : [];
+      var apiPayloads = (window.__vbApiPayloads || []).concat(nativeApiPayloads);
+      for (var ap = Math.max(0, apiPayloads.length - 32); ap < apiPayloads.length; ap++) {
         var payload = apiPayloads[ap];
         if (!payload || Date.now() - payload.at > 180000 || isAdUrl(payload.url)) continue;
+        var previousApiContext = activeApiContext;
+        activeApiContext = {
+          headers: payload.headers || {},
+          source: 'api-' + String(payload.source || 'response')
+        };
+        // Parsing each API payload once avoids repeating JSON/HLS work on every video scan.
+        // Cache only extracted URL + quality metadata, then replay the compact candidates
+        // into each collectSources() result so repeated calls in one scan keep the sources.
+        if (payload.__vbScanned && Array.isArray(payload.__vbParsedSources)) {
+          for (var cachedIndex = 0; cachedIndex < payload.__vbParsedSources.length; cachedIndex++) {
+            var cachedSource = payload.__vbParsedSources[cachedIndex];
+            if (cachedSource) add(cachedSource.url, cachedSource.meta || {});
+          }
+          activeApiContext = previousApiContext;
+          continue;
+        }
         var body = payload.text || '';
-        if (/^\s*#EXTM3U/m.test(body)) {
-          var lines = body.split(/\r?\n/);
-          var waitingVariant = null;
-          for (var li = 0; li < lines.length; li++) {
-            var line = lines[li].trim();
-            if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
-              waitingVariant = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
-              continue;
+        var originalAdd = add;
+        var parsedApiCandidates = [];
+        add = function(raw, meta) {
+          try {
+            var candidateUrl = absUrl(raw);
+            if (candidateUrl && isHttp(candidateUrl) && !isAdUrl(candidateUrl) && !isPreviewUrl(candidateUrl) && !isChunkUrl(candidateUrl) && isPlayerMediaUrl(candidateUrl, true) && parsedApiCandidates.length < 128) {
+              parsedApiCandidates.push({url:candidateUrl, meta:meta || {}});
             }
-            if (waitingVariant && line && line.charAt(0) !== '#') {
-              var variantUrl = absUrl(new URL(line, payload.url).href);
-              var resolution = String(waitingVariant.RESOLUTION || '');
-              var dims = /^(\d{2,5})x(\d{2,5})$/i.exec(resolution);
-              var variantHeight = dims ? Number(dims[2]) : 0;
-              var variantWidth = dims ? Number(dims[1]) : 0;
-              var variantLabel = waitingVariant.NAME || (variantHeight ? variantHeight + 'p' : '');
-              add(variantUrl, {
-                mime:'application/vnd.apple.mpegurl',
-                label:variantLabel,
-                width:variantWidth,
-                height:variantHeight
-              });
-              waitingVariant = null;
-            }
-            if (line.indexOf('#EXT-X-MEDIA:') === 0) {
-              var mediaAttrs = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
-              if (String(mediaAttrs.TYPE || '').toUpperCase() === 'VIDEO' && mediaAttrs.URI) {
-                var mediaResolution = String(mediaAttrs.RESOLUTION || '');
-                var mediaDims = /^(\d{2,5})x(\d{2,5})$/i.exec(mediaResolution);
-                var mediaHeight = mediaDims ? Number(mediaDims[2]) : 0;
-                var mediaWidth = mediaDims ? Number(mediaDims[1]) : 0;
-                add(absUrl(new URL(mediaAttrs.URI, payload.url).href), {
+          } catch (_) {}
+          return originalAdd(raw, meta);
+        };
+        try {
+          if (/^\s*#EXTM3U/m.test(body)) {
+            var lines = body.split(/\r?\n/);
+            var waitingVariant = null;
+            for (var li = 0; li < lines.length; li++) {
+              var line = lines[li].trim();
+              if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
+                waitingVariant = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+                continue;
+              }
+              if (waitingVariant && line && line.charAt(0) !== '#') {
+                var variantUrl = absUrl(new URL(line, payload.url).href);
+                var resolution = String(waitingVariant.RESOLUTION || '');
+                var dims = /^(\d{2,5})x(\d{2,5})$/i.exec(resolution);
+                var variantHeight = dims ? Number(dims[2]) : 0;
+                var variantWidth = dims ? Number(dims[1]) : 0;
+                var variantLabel = waitingVariant.NAME || (variantHeight ? variantHeight + 'p' : '');
+                add(variantUrl, {
                   mime:'application/vnd.apple.mpegurl',
-                  label:mediaAttrs.NAME || (mediaHeight ? mediaHeight + 'p' : ''),
-                  width:mediaWidth,
-                  height:mediaHeight
+                  label:variantLabel,
+                  width:variantWidth,
+                  height:variantHeight
                 });
+                waitingVariant = null;
+              }
+              if (line.indexOf('#EXT-X-MEDIA:') === 0) {
+                var mediaAttrs = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+                if (String(mediaAttrs.TYPE || '').toUpperCase() === 'VIDEO' && mediaAttrs.URI) {
+                  var mediaResolution = String(mediaAttrs.RESOLUTION || '');
+                  var mediaDims = /^(\d{2,5})x(\d{2,5})$/i.exec(mediaResolution);
+                  var mediaHeight = mediaDims ? Number(mediaDims[2]) : 0;
+                  var mediaWidth = mediaDims ? Number(mediaDims[1]) : 0;
+                  add(absUrl(new URL(mediaAttrs.URI, payload.url).href), {
+                    mime:'application/vnd.apple.mpegurl',
+                    label:mediaAttrs.NAME || (mediaHeight ? mediaHeight + 'p' : ''),
+                    width:mediaWidth,
+                    height:mediaHeight
+                  });
+                }
               }
             }
+            // The API endpoint itself may be a manifest even when its URL has no suffix.
+            add(payload.url, {mime:'application/vnd.apple.mpegurl'});
+          } else {
+            try {
+              var parsedPayload = JSON.parse(body);
+              parsePlayerConfig(parsedPayload, add, 0, true);
+            } catch (_) {
+              extractPlayerScriptUrls(body, add);
+            }
           }
-          // The API endpoint itself may be an HLS master/media playlist even when its
-          // URL is opaque and has no .m3u8 suffix. Preserve it as a manifest source.
-          add(payload.url, {mime:'application/vnd.apple.mpegurl'});
-        } else {
-          try {
-            var parsedPayload = JSON.parse(body);
-            parsePlayerConfig(parsedPayload, add, 0, true);
-          } catch (_) {
-            extractPlayerScriptUrls(body, add);
-          }
+        } catch (_) {
+        } finally {
+          add = originalAdd;
+          payload.__vbParsedSources = parsedApiCandidates;
+          payload.__vbScanned = true;
+          activeApiContext = previousApiContext;
         }
       }
       // 8) Known player adapters: prefer actual quality representations from the player instance.
-      try {
+      if (!apiOnly) try {
         if (typeof window.videojs === 'function' && window.videojs.getPlayers) {
           var vplayers = window.videojs.getPlayers() || {};
           var vkeys = Object.keys(vplayers);
@@ -499,13 +544,14 @@
       // preroll signal: retain the alternative source(s), but do not add the ad currentSrc.
       var shortUnclassifiedSource = currentDuration > 0 && currentDuration <= 12 &&
         (out.length === 0 || hasAlternativeSource) && !v.__vbContentTransition;
-      if (!adNow && !shortUnclassifiedSource) {
+      if (!apiOnly && !adNow && !shortUnclassifiedSource) {
         add(v.getAttribute('src'), {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
         add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
       v.__vbSourceMeta = out.slice(0, 128).map(function(u){
         var m = sourceMeta[u] || {};
-        return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || ''};
+        return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || '',
+          requestHeaders:m.requestHeaders || {}, captureSource:m.captureSource || ''};
       });
       return out.slice(0, 128);
     };
@@ -672,6 +718,24 @@
     // Keep the user-started video as primary even if the user scrolls it out of view.
     // When nothing is actively playing, use the largest visible content player.
     var primaryVideo = activeVideoEl || bestVideo || bestAdVideo;
+    var orphanSources = [];
+    var orphanSourceMeta = [];
+    var nativeApiQueueAvailable = typeof __vbNativeApiPayloads !== 'undefined' &&
+      Array.isArray(__vbNativeApiPayloads) && __vbNativeApiPayloads.length > 0;
+    var pageApiQueueAvailable = window.__vbApiPayloads && window.__vbApiPayloads.length > 0;
+    if (!primaryVideo && (pageApiQueueAvailable || nativeApiQueueAvailable)) {
+      // Parse only the already-captured API/manifest queue. Do not inspect arbitrary DOM/player
+      // state with a fake video element. This supports pages whose player lives in a cross-origin iframe.
+      var apiProbe = {
+        parentElement: null,
+        currentSrc: '', duration: 0, videoWidth: 0, videoHeight: 0,
+        getAttribute: function(){ return null; },
+        querySelectorAll: function(){ return []; },
+        getBoundingClientRect: function(){ return {left:0,top:0,right:0,bottom:0,width:0,height:0}; }
+      };
+      orphanSources = collectSources(apiProbe, true);
+      orphanSourceMeta = apiProbe.__vbSourceMeta || [];
+    }
     if (primaryVideo) {
       var pv = primaryVideo;
       var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
@@ -690,7 +754,7 @@
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
       };
     }
-    return JSON.stringify({ p: primary, a: active });
+    return JSON.stringify({ p: primary, a: active, o: orphanSources, om: orphanSourceMeta });
   } catch (_) {
     return JSON.stringify({ p: null, a: null });
   }

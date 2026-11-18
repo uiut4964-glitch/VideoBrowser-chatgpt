@@ -1,4 +1,4 @@
-# اختبارات استخراج الجودات — VideoBrowser 1.7
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.10
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 
@@ -11,6 +11,8 @@ node test_scan_sources.js
 node test_scan_api.js
 node test_scan_hls_payload.js
 node QualityMapConfigTest.js
+node test_early_api_capture.js
+node test_early_api_pipeline.js
 ```
 
 وتتحقق من:
@@ -18,6 +20,9 @@ node QualityMapConfigTest.js
 - التقاط إعداد JSON من fetch/XHR.
 - استخراج أربعة تمثيلات HLS من API manifest حتى عندما تكون روابطها بلا امتداد `.m3u8`.
 - قراءة خرائط جودة بمفاتيح مثل `240p`, `480p`, `720p`, `1080p`, `1440p`.
+- اختبار حقن مراقبة Fetch وXHR المبكر، وتمرير بيانات iframe عبر جسر WebView أصلي دون كشفها لسكريبتات صفحة الاستضافة، وحماية الترويسات السرية، واستبعاد أجسام الفيديو الثنائية وقراءات الاستجابة غير محدودة الحجم.
+- اختبار تكاملي لمحاكاة انتقال استجابة Fetch المبكرة عبر `SCAN_JS` حتى قائمة الجودات وبيانات كل مصدر.
+- اختبار حفظ مرشحات API بعد تحليلها مرة واحدة وإعادة استخدامها في فحوص الصفحة المتكررة.
 
 ## اختبارات Kotlin للمحلل وResolver
 
@@ -47,3 +52,5 @@ java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.CaptureHea
 ```
 
 `NetTestSupport.kt` وملفات `android/*` بدائل اختبار فقط؛ لا تنقلها إلى `app/src/main`.
+
+يُفحص ملف JavaScript المحقون عند بداية المستند منفصلًا بواسطة: `kotlinc app/src/main/java/com/example/videobrowser/ApiCaptureScript.kt -d /tmp/vb-early-api-capture.jar`.

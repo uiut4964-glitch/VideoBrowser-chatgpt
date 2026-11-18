@@ -34,6 +34,11 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -54,6 +59,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.File
@@ -258,10 +264,11 @@ private const val SCAN_JS = """
         }
       }
     };
-    var collectSources = function(v){
+    var collectSources = function(v, apiOnly){
       var out = [];
       var seen = Object.create(null);
       var sourceMeta = Object.create(null);
+      var activeApiContext = null;
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -272,8 +279,15 @@ private const val SCAN_JS = """
         if (incoming.width && !existing.width) existing.width = incoming.width;
         if (incoming.height && !existing.height) existing.height = incoming.height;
         if (incoming.mime && !existing.mime) existing.mime = incoming.mime;
+        if (activeApiContext) {
+          if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
+            existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
+          }
+          if (activeApiContext.source) existing.captureSource = activeApiContext.source;
+        }
         sourceMeta[u] = existing;
       };
+      if (!apiOnly) {
       // 1) إعدادات المحتوى المسبقة على عنصر الفيديو والحاويات القريبة.
       var n = v;
       var playerRoot = v.parentElement || document;
@@ -368,6 +382,7 @@ private const val SCAN_JS = """
           });
         }
       } catch (_) {}
+      }
       // 7) Dynamic API payloads: wrap fetch/XHR once and inspect only bounded text/JSON
       // responses that look like player metadata or manifests. Binary media is never read here.
       try {
@@ -457,65 +472,101 @@ private const val SCAN_JS = """
         }
         return attrs;
       };
-      var apiPayloads = window.__vbApiPayloads || [];
-      for (var ap = Math.max(0, apiPayloads.length - 24); ap < apiPayloads.length; ap++) {
+      var nativeApiPayloads = (typeof __vbNativeApiPayloads !== 'undefined' && Array.isArray(__vbNativeApiPayloads))
+        ? __vbNativeApiPayloads : [];
+      var apiPayloads = (window.__vbApiPayloads || []).concat(nativeApiPayloads);
+      for (var ap = Math.max(0, apiPayloads.length - 32); ap < apiPayloads.length; ap++) {
         var payload = apiPayloads[ap];
         if (!payload || Date.now() - payload.at > 180000 || isAdUrl(payload.url)) continue;
+        var previousApiContext = activeApiContext;
+        activeApiContext = {
+          headers: payload.headers || {},
+          source: 'api-' + String(payload.source || 'response')
+        };
+        // Parsing each API payload once avoids repeating JSON/HLS work on every video scan.
+        // Cache only extracted URL + quality metadata, then replay the compact candidates
+        // into each collectSources() result so repeated calls in one scan keep the sources.
+        if (payload.__vbScanned && Array.isArray(payload.__vbParsedSources)) {
+          for (var cachedIndex = 0; cachedIndex < payload.__vbParsedSources.length; cachedIndex++) {
+            var cachedSource = payload.__vbParsedSources[cachedIndex];
+            if (cachedSource) add(cachedSource.url, cachedSource.meta || {});
+          }
+          activeApiContext = previousApiContext;
+          continue;
+        }
         var body = payload.text || '';
-        if (/^\s*#EXTM3U/m.test(body)) {
-          var lines = body.split(/\r?\n/);
-          var waitingVariant = null;
-          for (var li = 0; li < lines.length; li++) {
-            var line = lines[li].trim();
-            if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
-              waitingVariant = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
-              continue;
+        var originalAdd = add;
+        var parsedApiCandidates = [];
+        add = function(raw, meta) {
+          try {
+            var candidateUrl = absUrl(raw);
+            if (candidateUrl && isHttp(candidateUrl) && !isAdUrl(candidateUrl) && !isPreviewUrl(candidateUrl) && !isChunkUrl(candidateUrl) && isPlayerMediaUrl(candidateUrl, true) && parsedApiCandidates.length < 128) {
+              parsedApiCandidates.push({url:candidateUrl, meta:meta || {}});
             }
-            if (waitingVariant && line && line.charAt(0) !== '#') {
-              var variantUrl = absUrl(new URL(line, payload.url).href);
-              var resolution = String(waitingVariant.RESOLUTION || '');
-              var dims = /^(\d{2,5})x(\d{2,5})$/i.exec(resolution);
-              var variantHeight = dims ? Number(dims[2]) : 0;
-              var variantWidth = dims ? Number(dims[1]) : 0;
-              var variantLabel = waitingVariant.NAME || (variantHeight ? variantHeight + 'p' : '');
-              add(variantUrl, {
-                mime:'application/vnd.apple.mpegurl',
-                label:variantLabel,
-                width:variantWidth,
-                height:variantHeight
-              });
-              waitingVariant = null;
-            }
-            if (line.indexOf('#EXT-X-MEDIA:') === 0) {
-              var mediaAttrs = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
-              if (String(mediaAttrs.TYPE || '').toUpperCase() === 'VIDEO' && mediaAttrs.URI) {
-                var mediaResolution = String(mediaAttrs.RESOLUTION || '');
-                var mediaDims = /^(\d{2,5})x(\d{2,5})$/i.exec(mediaResolution);
-                var mediaHeight = mediaDims ? Number(mediaDims[2]) : 0;
-                var mediaWidth = mediaDims ? Number(mediaDims[1]) : 0;
-                add(absUrl(new URL(mediaAttrs.URI, payload.url).href), {
+          } catch (_) {}
+          return originalAdd(raw, meta);
+        };
+        try {
+          if (/^\s*#EXTM3U/m.test(body)) {
+            var lines = body.split(/\r?\n/);
+            var waitingVariant = null;
+            for (var li = 0; li < lines.length; li++) {
+              var line = lines[li].trim();
+              if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
+                waitingVariant = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+                continue;
+              }
+              if (waitingVariant && line && line.charAt(0) !== '#') {
+                var variantUrl = absUrl(new URL(line, payload.url).href);
+                var resolution = String(waitingVariant.RESOLUTION || '');
+                var dims = /^(\d{2,5})x(\d{2,5})$/i.exec(resolution);
+                var variantHeight = dims ? Number(dims[2]) : 0;
+                var variantWidth = dims ? Number(dims[1]) : 0;
+                var variantLabel = waitingVariant.NAME || (variantHeight ? variantHeight + 'p' : '');
+                add(variantUrl, {
                   mime:'application/vnd.apple.mpegurl',
-                  label:mediaAttrs.NAME || (mediaHeight ? mediaHeight + 'p' : ''),
-                  width:mediaWidth,
-                  height:mediaHeight
+                  label:variantLabel,
+                  width:variantWidth,
+                  height:variantHeight
                 });
+                waitingVariant = null;
+              }
+              if (line.indexOf('#EXT-X-MEDIA:') === 0) {
+                var mediaAttrs = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+                if (String(mediaAttrs.TYPE || '').toUpperCase() === 'VIDEO' && mediaAttrs.URI) {
+                  var mediaResolution = String(mediaAttrs.RESOLUTION || '');
+                  var mediaDims = /^(\d{2,5})x(\d{2,5})$/i.exec(mediaResolution);
+                  var mediaHeight = mediaDims ? Number(mediaDims[2]) : 0;
+                  var mediaWidth = mediaDims ? Number(mediaDims[1]) : 0;
+                  add(absUrl(new URL(mediaAttrs.URI, payload.url).href), {
+                    mime:'application/vnd.apple.mpegurl',
+                    label:mediaAttrs.NAME || (mediaHeight ? mediaHeight + 'p' : ''),
+                    width:mediaWidth,
+                    height:mediaHeight
+                  });
+                }
               }
             }
+            // The API endpoint itself may be a manifest even when its URL has no suffix.
+            add(payload.url, {mime:'application/vnd.apple.mpegurl'});
+          } else {
+            try {
+              var parsedPayload = JSON.parse(body);
+              parsePlayerConfig(parsedPayload, add, 0, true);
+            } catch (_) {
+              extractPlayerScriptUrls(body, add);
+            }
           }
-          // The API endpoint itself may be an HLS master/media playlist even when its
-          // URL is opaque and has no .m3u8 suffix. Preserve it as a manifest source.
-          add(payload.url, {mime:'application/vnd.apple.mpegurl'});
-        } else {
-          try {
-            var parsedPayload = JSON.parse(body);
-            parsePlayerConfig(parsedPayload, add, 0, true);
-          } catch (_) {
-            extractPlayerScriptUrls(body, add);
-          }
+        } catch (_) {
+        } finally {
+          add = originalAdd;
+          payload.__vbParsedSources = parsedApiCandidates;
+          payload.__vbScanned = true;
+          activeApiContext = previousApiContext;
         }
       }
       // 8) Known player adapters: prefer actual quality representations from the player instance.
-      try {
+      if (!apiOnly) try {
         if (typeof window.videojs === 'function' && window.videojs.getPlayers) {
           var vplayers = window.videojs.getPlayers() || {};
           var vkeys = Object.keys(vplayers);
@@ -570,13 +621,14 @@ private const val SCAN_JS = """
       // preroll signal: retain the alternative source(s), but do not add the ad currentSrc.
       var shortUnclassifiedSource = currentDuration > 0 && currentDuration <= 12 &&
         (out.length === 0 || hasAlternativeSource) && !v.__vbContentTransition;
-      if (!adNow && !shortUnclassifiedSource) {
+      if (!apiOnly && !adNow && !shortUnclassifiedSource) {
         add(v.getAttribute('src'), {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
         add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
       v.__vbSourceMeta = out.slice(0, 128).map(function(u){
         var m = sourceMeta[u] || {};
-        return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || ''};
+        return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || '',
+          requestHeaders:m.requestHeaders || {}, captureSource:m.captureSource || ''};
       });
       return out.slice(0, 128);
     };
@@ -743,6 +795,24 @@ private const val SCAN_JS = """
     // Keep the user-started video as primary even if the user scrolls it out of view.
     // When nothing is actively playing, use the largest visible content player.
     var primaryVideo = activeVideoEl || bestVideo || bestAdVideo;
+    var orphanSources = [];
+    var orphanSourceMeta = [];
+    var nativeApiQueueAvailable = typeof __vbNativeApiPayloads !== 'undefined' &&
+      Array.isArray(__vbNativeApiPayloads) && __vbNativeApiPayloads.length > 0;
+    var pageApiQueueAvailable = window.__vbApiPayloads && window.__vbApiPayloads.length > 0;
+    if (!primaryVideo && (pageApiQueueAvailable || nativeApiQueueAvailable)) {
+      // Parse only the already-captured API/manifest queue. Do not inspect arbitrary DOM/player
+      // state with a fake video element. This supports pages whose player lives in a cross-origin iframe.
+      var apiProbe = {
+        parentElement: null,
+        currentSrc: '', duration: 0, videoWidth: 0, videoHeight: 0,
+        getAttribute: function(){ return null; },
+        querySelectorAll: function(){ return []; },
+        getBoundingClientRect: function(){ return {left:0,top:0,right:0,bottom:0,width:0,height:0}; }
+      };
+      orphanSources = collectSources(apiProbe, true);
+      orphanSourceMeta = apiProbe.__vbSourceMeta || [];
+    }
     if (primaryVideo) {
       var pv = primaryVideo;
       var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
@@ -761,7 +831,7 @@ private const val SCAN_JS = """
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
       };
     }
-    return JSON.stringify({ p: primary, a: active });
+    return JSON.stringify({ p: primary, a: active, o: orphanSources, om: orphanSourceMeta });
   } catch (_) {
     return JSON.stringify({ p: null, a: null });
   }
@@ -783,6 +853,8 @@ class MainActivity : AppCompatActivity() {
 
     private class Tab(val web: WebView) {
         var title = "علامة تبويب جديدة"
+        var documentStartScript: ScriptHandler? = null
+        var documentStartCaptureInstalled = false
         var url = ""
         var pending = false
         // media = المصادر الجاهزة للعرض؛ preparedMedia مصدرها DOM/تهيئة المشغل،
@@ -792,6 +864,9 @@ class MainActivity : AppCompatActivity() {
         val sniffed = LinkedHashMap<String, SniffedMedia>()
         // Full, non-secret request context is held only in memory for the current page session.
         val requestContexts = LinkedHashMap<String, CapturedMediaRequest>()
+        // Cross-origin iframe API payloads arrive through WebMessageListener and stay native-side.
+        val frameApiPayloads = LinkedHashMap<String, String>()
+        var syntheticApiUpdatedAt = 0L
         // طلبات مرشحة ظهرت أثناء إعلان ما قبل التشغيل؛ لا تُعرض للمستخدم إلا بعد انتقال المصدر إلى المحتوى.
         val pendingSniffed = LinkedHashMap<String, Long>()
         // طلبات وسائط التقطت قبل أن ينتهي فحص DOM من تحديد عنصر الفيديو الرئيسي.
@@ -979,7 +1054,10 @@ class MainActivity : AppCompatActivity() {
         MediaCaptureCoordinator.detach(this)
         ui.removeCallbacksAndMessages(null)
         content.removeAllViews()
-        tabs.forEach { it.web.destroy() }
+        tabs.forEach {
+            try { it.documentStartScript?.remove() } catch (_: Exception) {}
+            it.web.destroy()
+        }
         super.onDestroy()
     }
 
@@ -1179,7 +1257,11 @@ class MainActivity : AppCompatActivity() {
         t.media.clear()
         t.preparedMedia.clear()
         t.sniffed.clear()
+        try { t.documentStartScript?.remove() } catch (_: Exception) {}
+        t.documentStartScript = null
         t.requestContexts.clear()
+        t.frameApiPayloads.clear()
+        t.syntheticApiUpdatedAt = 0L
         t.pendingSniffed.clear()
         t.pageRequests.clear()
         t.resolvedFormats = null
@@ -1222,6 +1304,130 @@ class MainActivity : AppCompatActivity() {
         w.settings.userAgentString = if (desktop) DESKTOP_UA else defaultUa
     }
 
+    /**
+     * Install a native-only message bridge for cross-origin iframe captures.
+     * Unlike window.top.postMessage, this does not reveal iframe API response bodies to page scripts.
+     */
+    private fun installFrameApiMessageBridge(w: WebView, tab: Tab) {
+        try {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
+            WebViewCompat.addWebMessageListener(
+                w,
+                "VideoBrowserCapture",
+                setOf("*"),
+                object : WebViewCompat.WebMessageListener {
+                    override fun onPostMessage(
+                        view: WebView,
+                        message: WebMessageCompat,
+                        sourceOrigin: Uri,
+                        isMainFrame: Boolean,
+                        replyProxy: JavaScriptReplyProxy
+                    ) {
+                        if (view !== tab.web || isMainFrame || message.type != WebMessageCompat.TYPE_STRING) return
+                        captureFrameApiPayload(tab, message.data ?: return, sourceOrigin.toString())
+                    }
+                }
+            )
+        } catch (_: Exception) {
+            // Cross-origin iframe capture is optional; top-frame capture still works without this feature.
+        }
+    }
+
+    private fun sameWebOrigin(first: String, second: String): Boolean {
+        return try {
+            val a = Uri.parse(first)
+            val b = Uri.parse(second)
+            val schemeA = a.scheme?.lowercase().orEmpty()
+            val schemeB = b.scheme?.lowercase().orEmpty()
+            val hostA = a.host?.lowercase().orEmpty()
+            val hostB = b.host?.lowercase().orEmpty()
+            fun normalizedPort(uri: Uri, scheme: String): Int =
+                if (uri.port >= 0) uri.port else if (scheme == "https") 443 else if (scheme == "http") 80 else -1
+            schemeA in setOf("http", "https") && schemeA == schemeB &&
+                hostA.isNotBlank() && hostA == hostB && normalizedPort(a, schemeA) == normalizedPort(b, schemeB)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Validate and store bounded iframe API messages outside the page's JavaScript world. */
+    private fun captureFrameApiPayload(t: Tab, raw: String, sourceOrigin: String) {
+        if (raw.length !in 2..705_000) return
+        try {
+            val incoming = JSONObject(raw)
+            val claimedOrigin = incoming.optString("frameOrigin")
+            if (!sameWebOrigin(claimedOrigin, sourceOrigin)) return
+            val url = incoming.optString("url")
+            if (url.length !in 8..8192) return
+            val urlScheme = Uri.parse(url).scheme?.lowercase()
+            if (urlScheme != "http" && urlScheme != "https") return
+            val body = incoming.optString("text")
+            // Native validates relevance independently; page-provided bridge messages are untrusted.
+            if (body.isBlank() || body.length > 240_000 ||
+                !Regex("#EXTM3U|(?:sources|qualities|renditions|formats|m3u8|mpd|video[_-]?url|videoUrl|contentUrl|resolution|height|playbackUrl)", RegexOption.IGNORE_CASE).containsMatchIn(body)
+            ) return
+            val source = incoming.optString("source")
+            if (source != "fetch-api" && source != "xhr-api") return
+            val method = incoming.optString("method", "GET").uppercase()
+            if (method !in setOf("GET", "POST", "PUT")) return
+
+            val rawHeaders = incoming.optJSONObject("headers")
+            val headerMap = LinkedHashMap<String, String>()
+            if (rawHeaders != null) {
+                val keys = rawHeaders.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    headerMap[key] = rawHeaders.optString(key)
+                }
+            }
+            val safeHeaders = CaptureHeaders.safeRequestHeaders(headerMap)
+            val key = sourceOrigin + "|" + url + "|" + method + "|" + body.length + "|" + body.take(96)
+            val safePayload = JSONObject()
+                .put("key", key)
+                .put("url", url)
+                .put("text", body)
+                .put("at", incoming.optLong("at", System.currentTimeMillis()))
+                .put("type", incoming.optString("type").take(128))
+                .put("method", method)
+                .put("headers", JSONObject(safeHeaders))
+                .put("source", source)
+                .put("frameOrigin", sourceOrigin)
+            val encoded = safePayload.toString()
+            t.frameApiPayloads.remove(key)
+            t.frameApiPayloads[key] = encoded
+
+            val now = System.currentTimeMillis()
+            t.frameApiPayloads.entries.removeAll { entry ->
+                try { now - JSONObject(entry.value).optLong("at", 0L) !in 0L..180_000L }
+                catch (_: Exception) { true }
+            }
+            var totalChars = t.frameApiPayloads.values.sumOf { it.length }
+            while (t.frameApiPayloads.size > 16 || totalChars > 300_000) {
+                val oldest = t.frameApiPayloads.keys.firstOrNull() ?: break
+                totalChars -= t.frameApiPayloads.remove(oldest)?.length ?: 0
+            }
+        } catch (_: Exception) {
+            // Page-provided messages are untrusted; malformed payloads are ignored.
+        }
+    }
+
+    /** Install before the first loadUrl so the hook runs before page JavaScript in every frame. */
+    private fun installEarlyApiCapture(w: WebView, tab: Tab) {
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                tab.documentStartScript = WebViewCompat.addDocumentStartJavaScript(
+                    w,
+                    EARLY_API_CAPTURE_JS,
+                    setOf("*")
+                )
+                tab.documentStartCaptureInstalled = true
+            }
+        } catch (_: Exception) {
+            tab.documentStartScript = null
+            tab.documentStartCaptureInstalled = false
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(w: WebView, tab: Tab) {
         val s = w.settings
@@ -1236,6 +1442,8 @@ class MainActivity : AppCompatActivity() {
         s.javaScriptCanOpenWindowsAutomatically = false
         applyUa(w)
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        installFrameApiMessageBridge(w, tab)
+        installEarlyApiCapture(w, tab)
         w.addJavascriptInterface(VideoGestureBridge(
             onGesture = { id ->
                 ui.post {
@@ -1272,6 +1480,11 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
                 val t = tabOf(v) ?: return
+                // Older WebView providers may not implement DOCUMENT_START_SCRIPT.
+                // This fallback is best-effort and cannot guarantee catching the first page request.
+                if (!t.documentStartCaptureInstalled && url.startsWith("http", true)) {
+                    try { v.evaluateJavascript(EARLY_API_CAPTURE_JS, null) } catch (_: Exception) {}
+                }
                 t.url = url
                 resetVideoSession(t)
                 if (t === cur) { urlBar.setText(url); updateFab() }
@@ -1463,6 +1676,8 @@ class MainActivity : AppCompatActivity() {
         t.preparedMedia.clear()
         t.sniffed.clear()
         t.requestContexts.clear()
+        t.frameApiPayloads.clear()
+        t.syntheticApiUpdatedAt = 0L
         t.pendingSniffed.clear()
         t.pageRequests.clear()
         t.primaryVideoId = null
@@ -1644,7 +1859,8 @@ class MainActivity : AppCompatActivity() {
         val items = t.media.values.map { item ->
             if (blockedAsAd && item.origin == "dom") {
                 MediaItem(item.url, item.type, "dom-preroll", item.videoId, item.sourceEpoch,
-                    item.qualityHint, item.widthHint, item.heightHint, item.mimeHint)
+                    item.qualityHint, item.widthHint, item.heightHint, item.mimeHint,
+                    item.requestHeaders, item.captureSource)
             } else item
         }.sortedWith(compareBy<MediaItem> { if (it.origin == "dom" || it.origin == "dom-preroll") 0 else 1 }
             .thenBy { if (it.type == "hls") 0 else 1 })
@@ -1675,9 +1891,23 @@ class MainActivity : AppCompatActivity() {
         val width = meta?.optInt("width", 0)?.takeIf { it > 0 } ?: previous?.widthHint ?: 0
         val height = meta?.optInt("height", 0)?.takeIf { it > 0 } ?: previous?.heightHint ?: 0
         val mime = meta?.optString("mime")?.takeIf { it.isNotBlank() } ?: previous?.mimeHint.orEmpty()
+        val requestHeaderObject = meta?.optJSONObject("requestHeaders")
+        val requestHeaderMap = LinkedHashMap<String, String>()
+        if (requestHeaderObject != null) {
+            val keys = requestHeaderObject.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                requestHeaderMap[key] = requestHeaderObject.optString(key)
+            }
+        }
+        val safeRequestHeaders = CaptureHeaders.safeRequestHeaders(requestHeaderMap)
+        val captureSource = meta?.optString("captureSource")?.takeIf { it.isNotBlank() }
+            ?: previous?.captureSource.orEmpty()
         t.preparedMedia[url] = MediaItem(
             url, type, origin, videoId, t.primarySourceEpoch,
-            quality, width, height, mime
+            quality, width, height, mime,
+            CaptureHeaders.merge(previous?.requestHeaders.orEmpty(), safeRequestHeaders),
+            captureSource
         )
     }
 
@@ -1819,11 +2049,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun scan(t: Tab) {
         if (t.pending) return
-        t.web.evaluateJavascript(SCAN_JS) { r ->
+        val now = System.currentTimeMillis()
+        t.frameApiPayloads.entries.removeAll { entry ->
+            try { now - JSONObject(entry.value).optLong("at", 0L) !in 0L..180_000L }
+            catch (_: Exception) { true }
+        }
+        val pendingFramePayloads = LinkedHashMap(t.frameApiPayloads)
+        val nativeQueue = JSONArray()
+        pendingFramePayloads.values.forEach { encoded ->
+            try { nativeQueue.put(JSONObject(encoded)) } catch (_: Exception) {}
+        }
+        // Keep cross-origin iframe payloads in a lexical argument; never expose them as a page global.
+        val script = "(function(__vbNativeApiPayloads){return $SCAN_JS;})($nativeQueue)"
+        t.web.evaluateJavascript(script) { r ->
             try {
                 if (r != null && r != "null") {
                     val s = JSONTokener(r).nextValue() as? String
-                    if (s != null) onScan(t, JSONObject(s))
+                    if (s != null) {
+                        onScan(t, JSONObject(s))
+                        // Do not parse the same native payload on every polling cycle.
+                        pendingFramePayloads.forEach { (key, value) ->
+                            if (t.frameApiPayloads[key] == value) t.frameApiPayloads.remove(key)
+                        }
+                    }
                 }
             } catch (_: Exception) {
             }
@@ -1833,6 +2081,76 @@ class MainActivity : AppCompatActivity() {
     private fun onScan(t: Tab, o: JSONObject) {
         val p = o.optJSONObject("p")
         if (p == null) {
+            // Some sites host the entire player in a cross-origin iframe, leaving no VIDEO
+            // element in the top document. Use only early API/manifest candidates in that case.
+            val orphanSources = o.optJSONArray("o")
+            if (orphanSources != null && orphanSources.length() > 0 &&
+                (t.primaryVideoId == null || t.primaryVideoId?.startsWith("api-") == true)) {
+                val id = "api-" + Integer.toHexString(t.url.substringBefore('#').hashCode())
+                val urls = ArrayList<String>(orphanSources.length())
+                for (i in 0 until orphanSources.length()) {
+                    val url = orphanSources.optString(i)
+                    if (url.startsWith("http://", true) || url.startsWith("https://", true)) urls.add(url)
+                }
+                if (urls.isNotEmpty()) {
+                    val oldUrls = t.preparedMedia.keys.toSet()
+                    val newUrls = urls.toSet()
+                    val isNewSyntheticVideo = t.primaryVideoId != id
+                    val isDisjointSourceSet = !isNewSyntheticVideo && oldUrls.isNotEmpty() &&
+                        newUrls.isNotEmpty() && oldUrls.intersect(newUrls).isEmpty()
+                    if (isNewSyntheticVideo || isDisjointSourceSet) {
+                        t.media.clear()
+                        t.preparedMedia.clear()
+                        t.sniffed.clear()
+                        t.primarySourceEpoch++
+                        t.userGestureVideoIds.clear()
+                    }
+                    t.primaryVideoId = id
+                    t.syntheticApiUpdatedAt = System.currentTimeMillis()
+                    t.primarySourceKey = urls.distinct().sorted().joinToString("||")
+                    t.primaryCurrentSrc = ""
+                    t.primaryCycle = 0
+                    t.primaryIsAd = false
+                    t.suspectedPreroll = false
+                    t.expectedDurationSec = 0.0
+                    t.poster = ""
+                    t.activePlayback = false
+                    t.activeId = null
+
+                    val metadata = HashMap<String, JSONObject>()
+                    val metadataArray = o.optJSONArray("om")
+                    if (metadataArray != null) {
+                        for (i in 0 until metadataArray.length()) {
+                            val item = metadataArray.optJSONObject(i) ?: continue
+                            val url = item.optString("url")
+                            if (url.isNotBlank()) metadata[url] = item
+                        }
+                    }
+                    for (url in urls.distinct()) addPreparedSource(t, url, id, metadata[url])
+                    if (isNewSyntheticVideo || isDisjointSourceSet) promotePageRequests(t, id, t.primarySourceEpoch, false)
+                    syncMedia(t)
+                }
+            } else if (t.primaryVideoId?.startsWith("api-") == true) {
+                // Keep successfully parsed iframe sources for the same 3-minute capture window,
+                // even though the one-shot native payload queue has already been consumed.
+                val stillFresh = t.preparedMedia.isNotEmpty() &&
+                    System.currentTimeMillis() - t.syntheticApiUpdatedAt in 0L..180_000L
+                if (!stillFresh) {
+                    t.media.clear()
+                    t.preparedMedia.clear()
+                    t.sniffed.clear()
+                    t.primaryVideoId = null
+                    t.primarySourceKey = ""
+                    t.primaryCurrentSrc = ""
+                    t.primaryIsAd = false
+                    t.suspectedPreroll = false
+                    t.expectedDurationSec = 0.0
+                    t.syntheticApiUpdatedAt = 0L
+                    t.resolvedFormats = null
+                    t.resolvedKey = ""
+                    t.resolvingKey = ""
+                }
+            }
             t.activePlayback = false
             t.activeId = null
             // لا نمسح المصادر المحضّرة لمجرد أن العنصر خرج مؤقتًا من DOM/الرؤية.
@@ -1858,6 +2176,7 @@ class MainActivity : AppCompatActivity() {
 
         val primaryChanged = t.primaryVideoId != id
         if (primaryChanged) {
+            t.syntheticApiUpdatedAt = 0L
             t.media.clear()
             t.preparedMedia.clear()
             t.sniffed.clear()

@@ -20,6 +20,13 @@ const run=new Function('window','document','location','getComputedStyle','const 
   await new Promise(resolve=>setTimeout(resolve,0));
   const result=JSON.parse(run(window,document,{href:document.baseURI},getComputedStyle));
   const sources=result.p.sources;
+  if (!window.__vbApiPayloads[0].__vbScanned || !Array.isArray(window.__vbApiPayloads[0].__vbParsedSources)) {
+    throw new Error('API payload was not cached after its first parse');
+  }
+  const cachedResult=JSON.parse(run(window,document,{href:document.baseURI},getComputedStyle));
+  if (![240,480,720,1080].every(q=>cachedResult.p.sources.some(u=>u.includes(`opaque${q}`)))) {
+    throw new Error('Cached API candidates were not replayed on the next collectSources call');
+  }
   for(const q of [240,480,720,1080]) if(!sources.some(u=>u.includes(`opaque${q}`))) throw new Error('missing API quality '+q+': '+sources.join(','));
   for(const q of [240,480,720,1080]) {
     const meta=result.p.sourceMeta.find(x=>x.url.includes('opaque'+q));
