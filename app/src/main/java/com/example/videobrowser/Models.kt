@@ -8,7 +8,13 @@ class MediaItem(
     val type: String,
     val origin: String = "dom",
     val videoId: String = "",
-    val sourceEpoch: Int = 0
+    val sourceEpoch: Int = 0,
+    // Quality metadata copied from the site's player manifest/config. This is
+    // essential for opaque signed URLs that contain no 720p/1080p in the URL.
+    val qualityHint: String = "",
+    val widthHint: Int = 0,
+    val heightHint: Int = 0,
+    val mimeHint: String = ""
 )
 
 class Format(

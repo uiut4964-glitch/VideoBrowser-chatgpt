@@ -7,7 +7,16 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object Hls {
-    class Variant(val url: String, val resolution: String, val bandwidth: Long, val avg: Long = 0L)
+    class Variant(
+        val url: String,
+        val resolution: String,
+        val bandwidth: Long,
+        val avg: Long = 0L,
+        val name: String = "",
+        val codecs: String = "",
+        val frameRate: Double = 0.0,
+        val videoRange: String = ""
+    )
     class Seg(
         val url: String,
         val keyUri: String?,
@@ -41,23 +50,63 @@ object Hls {
 
     fun resolve(base: String, ref: String): String = URL(URL(base), ref).toString()
 
-    fun isMaster(text: String): Boolean = text.lineSequence().any { it.trim().startsWith("#EXT-X-STREAM-INF") }
+    fun isMaster(text: String): Boolean = text.lineSequence().any { line ->
+        val trimmed = line.trim()
+        trimmed.startsWith("#EXT-X-STREAM-INF") ||
+            (trimmed.startsWith("#EXT-X-MEDIA:") && attributes(trimmed.substringAfter(':'))["TYPE"] == "VIDEO")
+    }
 
     fun parseMaster(text: String, base: String): List<Variant> {
         val out = ArrayList<Variant>()
-        val lines = text.lines().map { it.trim() }
+        val lines = text.lineSequence().map { it.trim() }.toList()
+        fun addVariant(rawUri: String, attrs: Map<String, String>) {
+            if (rawUri.isBlank()) return
+            val uri = resolve(base, rawUri)
+            if (out.any { it.url == uri }) return
+            val bw = attrs["BANDWIDTH"]?.toLongOrNull() ?: 0L
+            val avg = attrs["AVERAGE-BANDWIDTH"]?.toLongOrNull() ?: 0L
+            out.add(
+                Variant(
+                    uri,
+                    attrs["RESOLUTION"] ?: "",
+                    bw,
+                    avg,
+                    attrs["NAME"] ?: "",
+                    attrs["CODECS"] ?: "",
+                    attrs["FRAME-RATE"]?.toDoubleOrNull() ?: 0.0,
+                    attrs["VIDEO-RANGE"] ?: ""
+                )
+            )
+        }
+
         var i = 0
         while (i < lines.size) {
-            val l = lines[i]
-            if (l.startsWith("#EXT-X-STREAM-INF:")) {
-                val attrs = attributes(l.substringAfter(':'))
-                val bw = attrs["BANDWIDTH"]?.toLongOrNull() ?: 0L
-                val avg = attrs["AVERAGE-BANDWIDTH"]?.toLongOrNull() ?: 0L
-                val res = attrs["RESOLUTION"] ?: ""
-                var j = i + 1
-                while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
-                if (j < lines.size) out.add(Variant(resolve(base, lines[j]), res, bw, avg))
-                i = j
+            val line = lines[i]
+            when {
+                line.startsWith("#EXT-X-STREAM-INF:") -> {
+                    val attrs = attributes(line.substringAfter(':'))
+                    // URI is normally the next non-comment line. Accept a URI attribute too
+                    // for manifests emitted by packagers that inline the variant URI.
+                    val inlineUri = attrs["URI"]
+                    if (!inlineUri.isNullOrBlank()) {
+                        addVariant(inlineUri, attrs)
+                    } else {
+                        var j = i + 1
+                        while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
+                        if (j < lines.size) {
+                            addVariant(lines[j], attrs)
+                            i = j
+                        }
+                    }
+                }
+                line.startsWith("#EXT-X-MEDIA:") -> {
+                    val attrs = attributes(line.substringAfter(':'))
+                    // Some master playlists expose alternate video renditions via TYPE=VIDEO.
+                    if (attrs["TYPE"] == "VIDEO") {
+                        val uri = attrs["URI"]
+                        if (!uri.isNullOrBlank()) addVariant(uri, attrs)
+                    }
+                }
             }
             i++
         }

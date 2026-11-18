@@ -1,5 +1,7 @@
 package com.example.videobrowser
 
+import android.media.MediaMetadataRetriever
+import android.webkit.CookieManager
 import java.io.IOException
 import java.util.Locale
 
@@ -57,13 +59,14 @@ object Formats {
 
     /** اسم الجودة بالأسلوب المعتاد: 720P HD ... */
     fun qualityLabel(w: Int, h: Int): String {
-        val s = minOf(w, h)
-        return when {
-            s >= 2000 -> "2160P 4K"
-            s >= 1300 -> "1440P 2K"
-            s >= 1000 -> "1080P HD"
-            s >= 700 -> "720P HD"
-            else -> s.toString() + "P"
+        // اعرض الدقة الفعلية ولا ترفعها اصطناعيًا إلى 2K/4K.
+        val shortSide = minOf(w, h)
+        return when (shortSide) {
+            in 2100..2300 -> "2160P 4K"
+            in 1380..1500 -> "1440P 2K"
+            in 1040..1120 -> "1080P HD"
+            in 680..760 -> "720P HD"
+            else -> shortSide.toString() + "P"
         }
     }
 
@@ -102,81 +105,230 @@ object Formats {
         return Info(m.duration, bytes, w, hh)
     }
 
+    /** قراءة مدة/أبعاد الملف المباشر عند الحاجة لتمييز فيديو المحتوى عن ملف إعلان قصير.
+     * تُستخدم خصوصًا للمصادر الشبكية التي جُمعت أثناء preroll؛ ولا نعتمد عليها وحدها إذا فشل الخادم.
+     */
+    private fun remoteVideoInfo(url: String, headers: Map<String, String>): Info? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            val requestHeaders = HashMap(headers)
+            try {
+                CookieManager.getInstance().getCookie(url)?.let { cookie ->
+                    if (cookie.isNotBlank() && requestHeaders.keys.none { it.equals("Cookie", true) }) {
+                        requestHeaders["Cookie"] = cookie
+                    }
+                }
+            } catch (_: Exception) {}
+            retriever.setDataSource(url, requestHeaders)
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            Info(durationMs.coerceAtLeast(0L) / 1000.0, -1L, width, height).takeIf { durationMs > 0L }
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun qualityFromUrl(url: String): Int? {
+        val decoded = try { java.net.URLDecoder.decode(url, "UTF-8") } catch (_: Exception) { url }
+        Regex("(?i)(\\d{3,4})x(\\d{3,4})").find(decoded)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
+        Regex("(?i)(?:^|[^0-9])(\\d{3,4})\\s*p(?:[^a-z]|$)").find(decoded)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+        val uri = try { java.net.URI(decoded) } catch (_: Exception) { null }
+        if (uri != null) {
+            val query = uri.rawQuery.orEmpty().split('&')
+            for (part in query) {
+                val pair = part.split('=', limit = 2)
+                if (pair.size != 2) continue
+                val key = try { java.net.URLDecoder.decode(pair[0], "UTF-8") } catch (_: Exception) { pair[0] }
+                val value = try { java.net.URLDecoder.decode(pair[1], "UTF-8") } catch (_: Exception) { pair[1] }
+                if (key.equals("quality", true) || key.equals("resolution", true) || key.equals("height", true)) {
+                    Regex("(?i)(\\d{3,4})\\s*p?").find(value)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Extract the actual rendition height from a human/player label.
+     * Do not take the first 3-4 digit number blindly: labels such as
+     * "H.264 1080p" or "AVC1.640028 / 720p" contain codec/profile numbers
+     * before the resolution. Those numbers used to make every rendition share
+     * one deduplication key (for example 264), hiding the other qualities.
+     */
+    fun qualityFromLabel(label: String): Int? {
+        val text = label.lowercase(Locale.ROOT).trim()
+        if (text.isEmpty()) return null
+
+        // Explicit quality suffix wins over codec/profile identifiers.
+        Regex("(?<![a-z0-9.])(\\d{3,4})\\s*p(?:\\s*\\d{1,3}\\s*fps?)?(?![a-z0-9])", RegexOption.IGNORE_CASE)
+            .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+
+        // Resolution is conventionally width x height; use the second number.
+        Regex("(?<![a-z0-9])(\\d{3,5})\\s*[x×]\\s*(\\d{3,5})(?![a-z0-9])", RegexOption.IGNORE_CASE)
+            .find(text)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
+
+        when {
+            Regex("\\b4k\\b|\\buhd\\b").containsMatchIn(text) -> return 2160
+            Regex("\\b2k\\b|\\bqhd\\b").containsMatchIn(text) -> return 1440
+            Regex("\\bfhd\\b|full[ -]?hd").containsMatchIn(text) -> return 1080
+        }
+
+        // Standalone numeric quality labels ("1080", "720 HD") are supported,
+        // but numbers embedded in codec names (H.264, AVC1.640028) are ignored.
+        Regex("(?<![a-z0-9.])(\\d{3,4})(?:\\s*(?:hd|sd))?(?![a-z0-9])", RegexOption.IGNORE_CASE)
+            .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+
+        return if (Regex("\\bhd\\b").containsMatchIn(text)) 720 else null
+    }
+
+    /** Resolve all video renditions from an HLS master, including nested master playlists. */
+    private fun resolveHlsMaster(
+        masterUrl: String,
+        masterText: String,
+        headers: Map<String, String>,
+        out: MutableList<Format>,
+        visited: MutableSet<String>,
+        depth: Int
+    ) {
+        if (depth > 4) throw IOException("تجاوز عمق قوائم HLS الرئيسية المتداخلة")
+        if (!visited.add(masterUrl)) return
+        val variants = Hls.parseMaster(masterText, masterUrl)
+        if (variants.isEmpty()) throw IOException("قائمة HLS الرئيسية لا تحتوي تمثيلات فيديو")
+
+        for (variant in variants) {
+            if (isAdUrl(variant.url) || isPreviewUrl(variant.url) || variant.url in visited) continue
+            val childText = try { Net.fetchText(variant.url, headers) } catch (_: Exception) { continue }
+            if (Hls.isMaster(childText)) {
+                resolveHlsMaster(variant.url, childText, headers, out, visited, depth + 1)
+                continue
+            }
+            visited.add(variant.url)
+            val media = try { Hls.parseMedia(childText, variant.url) } catch (_: Exception) { continue }
+            if (media.segs.isEmpty()) continue
+            var width = 0
+            var height = 0
+            val resolutionParts = variant.resolution.split('x')
+            if (resolutionParts.size == 2) {
+                width = resolutionParts[0].toIntOrNull() ?: 0
+                height = resolutionParts[1].toIntOrNull() ?: 0
+            }
+            var duration = media.duration
+            var estimatedBytes = -1L
+            val bandwidth = if (variant.avg > 0L) variant.avg else variant.bandwidth
+            if (height <= 0) {
+                try {
+                    val info = mediaInfo(variant.url, headers, true)
+                    duration = info.duration.takeIf { it > 0.0 } ?: duration
+                    estimatedBytes = info.bytes
+                    width = info.w
+                    height = info.h
+                } catch (_: Exception) {}
+            }
+            if (estimatedBytes <= 0L && duration > 0.0 && bandwidth > 0L) {
+                estimatedBytes = (bandwidth.toDouble() / 8.0 * duration).toLong()
+            }
+            val label = when {
+                height > 0 -> qualityLabel(width, height)
+                variant.name.isNotBlank() && Regex("(?i)(\\d{3,4}\\s*p|4k|2k|hd|sd)").containsMatchIn(variant.name) -> variant.name
+                bandwidth > 0L -> "جودة " + String.format(Locale.US, "%.1f Mbps", bandwidth / 1_000_000.0)
+                else -> "جودة غير معروفة"
+            }
+            val details = buildList {
+                if (variant.resolution.isNotBlank()) add(variant.resolution)
+                if (variant.frameRate > 0.0) add(String.format(Locale.US, "%.0f fps", variant.frameRate))
+                if (variant.codecs.isNotBlank()) add(variant.codecs)
+            }.joinToString(" • ")
+            val ext = if (media.init != null) "mp4" else "ts"
+            out.add(Format(label, details, variant.url, "hls", ext, true, fmtEst(estimatedBytes), false, duration, estimatedBytes))
+        }
+
+        for (audio in Hls.parseAudio(masterText, masterUrl).filterNot { isAdUrl(it.url) || isPreviewUrl(it.url) }.take(3)) {
+            if (out.any { it.url == audio.url }) continue
+            var estimated = -1L
+            var audioDuration = 0.0
+            try {
+                val info = mediaInfo(audio.url, headers, false)
+                estimated = info.bytes
+                audioDuration = info.duration
+            } catch (_: Exception) {}
+            out.add(Format("صوت (" + audio.name + ")", "", audio.url, "hls", "ts", true, fmtEst(estimated), true, audioDuration, estimated))
+        }
+    }
+
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
         if (isAdUrl(item.url) || isPreviewUrl(item.url)) return out
-        if (item.type == "hls") {
+
+        // بعض المواقع تقدّم master playlist عبر endpoint لا ينتهي بـ .m3u8.
+        // افحص MIME من HEAD/Range probe قبل افتراض أن كل URL بلا امتداد ملف مباشر.
+        val probe = if (item.type == "hls") null else Net.probe(item.url, h)
+        val probeMime = probe?.mime.orEmpty().lowercase(Locale.ROOT)
+        val uriPath = try { java.net.URI(item.url).rawPath.orEmpty().lowercase(Locale.ROOT) } catch (_: Exception) { "" }
+        val hlsByMime = probeMime.contains("mpegurl") || probeMime.contains("m3u8")
+        val hlsByPathHint = uriPath.contains("/hls/") || uriPath.contains("/playlist") || uriPath.contains("/manifest.m3u8")
+        val isHls = item.type == "hls" || hlsByMime || hlsByPathHint
+
+        if (isHls) {
             val text = Net.fetchText(item.url, h)
+            if (!text.trimStart().startsWith("#EXTM3U")) throw IOException("مصدر HLS لا يحتوي قائمة M3U8 صالحة")
             if (Hls.isMaster(text)) {
-                val vars = Hls.parseMaster(text, item.url).sortedWith(
-                    compareByDescending<Hls.Variant> { it.resolution.substringAfter('x', "0").toIntOrNull() ?: 0 }
-                        .thenByDescending { it.bandwidth }
-                )
-                for (v in vars) {
-                    if (isAdUrl(v.url) || isPreviewUrl(v.url)) continue
-                    var dur = 0.0
-                    var est = -1L
-                    var w = 0
-                    var hh = 0
-                    val rs = v.resolution.split('x')
-                    if (rs.size == 2) { w = rs[0].toIntOrNull() ?: 0; hh = rs[1].toIntOrNull() ?: 0 }
-                    try {
-                        if (hh > 0) {
-                            val m = Hls.parseMedia(Net.fetchText(v.url, h), v.url)
-                            dur = m.duration
-                            val bps = if (v.avg > 0) v.avg else v.bandwidth
-                            if (dur > 0 && bps > 0) est = (bps / 8 * dur).toLong()
-                        } else {
-                            val inf = mediaInfo(v.url, h, true)
-                            dur = inf.duration; est = inf.bytes; w = inf.w; hh = inf.h
-                        }
-                    } catch (e: Exception) {
-                    }
-                    val label = if (hh > 0) qualityLabel(w, hh)
-                    else "جودة " + String.format(Locale.US, "%.1f Mbps", v.bandwidth / 1_000_000.0)
-                    if (est <= 0 && v.bandwidth > 0 && dur > 0) est = (v.bandwidth / 8 * dur).toLong()
-                    out.add(Format(label, v.resolution, v.url, "hls", "ts", true, fmtEst(est), false, dur, est))
-                }
-                for (a in Hls.parseAudio(text, item.url).filterNot { isAdUrl(it.url) || isPreviewUrl(it.url) }.take(3)) {
-                    var est = -1L
-                    var dur = 0.0
-                    try {
-                        val inf = mediaInfo(a.url, h, false)
-                        est = inf.bytes; dur = inf.duration
-                    } catch (e: Exception) {
-                    }
-                    out.add(Format("صوت (" + a.name + ")", "", a.url, "hls", "ts", true, fmtEst(est), true, dur))
-                }
+                resolveHlsMaster(item.url, text, h, out, LinkedHashSet(), 0)
             } else {
                 val inf = mediaInfo(item.url, h, true)
-                val m0 = Hls.parseMedia(text, item.url)
+                val media = Hls.parseMedia(text, item.url)
                 val label = if (inf.h > 0) qualityLabel(inf.w, inf.h)
                 else if (inf.bytes > 0 && inf.duration > 0)
                     "جودة " + String.format(Locale.US, "%.1f Mbps", inf.bytes * 8 / inf.duration / 1_000_000.0)
                 else "جودة غير معروفة"
                 out.add(
                     Format(
-                        label, inf.w.toString() + "x" + inf.h, item.url, "hls",
-                        if (m0.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration
+                        label, if (inf.w > 0 && inf.h > 0) "${inf.w}x${inf.h}" else "", item.url, "hls",
+                        if (media.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration, inf.bytes
                     )
                 )
             }
         } else {
-            val p = Net.probe(item.url, h)
-            if (p.mime.startsWith("text/") || p.mime.startsWith("image/") ||
-                p.mime.contains("json") || p.mime.contains("html")
+            val p = probe ?: Net.probe(item.url, h)
+            // DASH MPD ليس ملف فيديو مباشرًا؛ لا تعرضه كـ MP4 لأن ذلك سينزّل XML بدل الفيديو.
+            if (probeMime.contains("dash+xml") || uriPath.endsWith(".mpd")) {
+                throw IOException("المصدر يستخدم MPEG-DASH (MPD)، واستخراج تمثيلاته وتنزيلها يحتاج مسار DASH مستقلًا")
+            }
+            val hasTrustedVideoMetadata = item.heightHint > 0 || item.qualityHint.isNotBlank() ||
+                item.mimeHint.startsWith("video/", true)
+            if ((p.mime.startsWith("text/") && !(hasTrustedVideoMetadata && !p.mime.contains("html") && !p.mime.contains("xml"))) ||
+                p.mime.startsWith("image/") || p.mime.contains("json") || p.mime.contains("html") || p.mime.contains("xml")
             ) return out
             if (p.total in 1L..30000L) return out
-            val ext = extOf(item.url, p.mime)
-            val q = Regex("(\\d{3,4})[pP](?![a-zA-Z])").find(item.url)?.groupValues?.get(1)?.toIntOrNull()
-            val audio = isAudio(ext)
-            val label = if (audio) ext.uppercase()
-            else if (q != null) qualityLabel(q * 16 / 9, q)
-            else "الجودة الأصلية"
+            // Prefer MIME/quality information from the player's own manifest/config.
+            // Signed CDN URLs often have opaque paths and reveal neither extension nor
+            // resolution in their URL; dropping this metadata made every rendition appear
+            // as the same "original quality" or allowed only the first low-quality source.
+            val declaredMime = item.mimeHint.takeIf { it.isNotBlank() } ?: p.mime
+            val ext = extOf(item.url, declaredMime)
+            val q = qualityFromUrl(item.url)
+                ?: item.heightHint.takeIf { it in 144..4320 }
+                ?: qualityFromLabel(item.qualityHint)
+            val needRemoteInfo = item.origin == "network-pending-ad" || item.origin == "dom-preroll" ||
+                (q == null && (item.widthHint <= 0 || item.heightHint <= 0))
+            val remoteInfo = if (needRemoteInfo) remoteVideoInfo(item.url, h) else null
+            val audio = isAudio(ext) || p.mime.startsWith("audio/", true) || item.mimeHint.startsWith("audio/", true)
+            val width = remoteInfo?.w?.takeIf { it > 0 } ?: item.widthHint
+            val height = remoteInfo?.h?.takeIf { it > 0 } ?: item.heightHint.takeIf { it > 0 } ?: (q ?: 0)
+            val label = when {
+                audio -> ext.uppercase()
+                height > 0 -> qualityLabel(width.takeIf { it > 0 } ?: (height * 16 / 9), height)
+                item.qualityHint.isNotBlank() -> item.qualityHint
+                q != null -> qualityLabel(q * 16 / 9, q)
+                else -> "الجودة الأصلية"
+            }
             val d = ArrayList<String>()
             d.add(Util.host(item.url))
+            if (width > 0 && height > 0) d.add("${width}x${height}")
             d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
-            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, Util.fmtSize(p.total), audio, 0.0, p.total))
+            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, fmtEst(p.total), audio, remoteInfo?.duration ?: 0.0, p.total))
         }
         return out
     }

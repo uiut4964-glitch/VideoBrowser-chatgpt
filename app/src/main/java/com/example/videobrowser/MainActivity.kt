@@ -145,41 +145,134 @@ private const val SCAN_JS = """
       var ih = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
       return r.width >= 70 && r.height >= 45 && iw >= 55 && ih >= 35;
     };
-    var parsePlayerConfig = function(raw, add, depth){
-      if (raw === null || raw === undefined || depth > 8) return;
+    var isKnownNonVideoUrl = function(raw){
+      var p = '';
+      try { p = new URL(absUrl(raw)).pathname.toLowerCase(); } catch (_) {}
+      return /\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|js|json|vtt|srt|woff2?|ttf|otf)(?:$)/i.test(p);
+    };
+    var isPreviewUrl = function(raw){
+      var s = String(raw || '').toLowerCase();
+      try { s = decodeURIComponent(s); } catch (_) {}
+      return /(?:^|[\/_.?&=-])(preview|previews|thumbnail|thumb|thumbs|poster|trailer|trailers|teaser|teasers|storyboard|sprite)(?:[\/_.?&=-]|$)/i.test(s);
+    };
+    var isPlayerMediaUrl = function(raw, trustedVideoContext){
+      if (isMediaUrl(raw)) return true;
+      if (!trustedVideoContext || isKnownNonVideoUrl(raw)) return false;
+      var u = absUrl(raw);
+      if (!isHttp(u)) return false;
+      // بعض CDN endpoints لا تضع امتداد الملف في المسار؛ نقبلها فقط عندما تأتي
+      // من كائن مصدر فيديو صريح يحوي type/height/quality أو من حقل file/manifest.
+      return !isChunkUrl(u);
+    };
+    var mergeQualityMeta = function(raw, inherited, keyHint){
+      var meta = Object.assign({}, inherited || {});
+      if (typeof raw === 'object' && raw) {
+        var label = raw.label || raw.quality || raw.resolution || raw.qualityLabel || raw.formatLabel || '';
+        if (label && /(?:\d{3,4}\s*p|\d{3,4}\s*x\s*\d{3,4}|2k|4k|uhd|qhd|fhd|hd)/i.test(String(label))) meta.label = String(label).trim();
+        var w = Number(raw.width || raw.videoWidth || raw.w || 0);
+        var h = Number(raw.height || raw.videoHeight || raw.video_height || raw.h || 0);
+        if ((!w || !h) && typeof raw.resolution === 'string') {
+          var dims = /(?:^|\D)(\d{3,4})\s*x\s*(\d{3,4})(?:\D|$)/i.exec(raw.resolution);
+          if (dims) { w = w || Number(dims[1]); h = h || Number(dims[2]); }
+        }
+        if (w > 0 && w < 10000) meta.width = w;
+        if (h > 0 && h < 10000) meta.height = h;
+        var mime = raw.mimeType || raw.mime_type || raw.contentType || raw.content_type || raw.type || '';
+        if (mime && /^(video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl)|audio\/)/i.test(String(mime))) meta.mime = String(mime);
+      }
+      if (keyHint) {
+        var key = String(keyHint).trim();
+        if (/^(\d{3,4})p?$/i.test(key)) {
+          var kh = Number(key.match(/\d+/)[0]);
+          meta.height = meta.height || kh;
+          meta.label = meta.label || (kh + 'p');
+        } else if (/^(2k|qhd)$/i.test(key)) {
+          meta.height = meta.height || 1440;
+          meta.label = meta.label || '1440p 2K';
+        } else if (/^(4k|uhd)$/i.test(key)) {
+          meta.height = meta.height || 2160;
+          meta.label = meta.label || '2160p 4K';
+        }
+      }
+      if (meta.height && !meta.label) meta.label = meta.height + 'p';
+      return meta;
+    };
+    var parsePlayerConfig = function(raw, add, depth, videoContext, inheritedMeta, keyHint){
+      if (raw === null || raw === undefined || depth > 10) return;
+      var trusted = !!videoContext;
+      var meta = mergeQualityMeta(raw, inheritedMeta, keyHint);
       if (typeof raw === 'string') {
         var value = raw.trim();
         if (!value) return;
-        if ((value.charAt(0) === '{' || value.charAt(0) === '[') && value.length < 500000) {
-          try { parsePlayerConfig(JSON.parse(value), add, depth + 1); return; } catch (_) {}
+        if ((value.charAt(0) === '{' || value.charAt(0) === '[') && value.length < 750000) {
+          try { parsePlayerConfig(JSON.parse(value), add, depth + 1, trusted, meta); return; } catch (_) {}
         }
-        if (isMediaUrl(value)) add(value);
+        if (isPlayerMediaUrl(value, trusted)) add(value, meta);
         return;
       }
       if (Array.isArray(raw)) {
-        for (var i = 0; i < Math.min(raw.length, 80); i++) parsePlayerConfig(raw[i], add, depth + 1);
+        for (var i = 0; i < Math.min(raw.length, 240); i++) parsePlayerConfig(raw[i], add, depth + 1, trusted, meta);
         return;
       }
       if (typeof raw !== 'object') return;
       var badKey = /(^|[_-])(ad|ads|advert|advertisement|vast|vmap|preroll|midroll|postroll|promo|preview|thumb|poster|trailer|teaser|sponsor)([_-]|$)|^(ad|ads|advert|vast|vmap|preroll|midroll|postroll|promo|preview|thumb|poster|trailer|teaser|sponsor)/i;
-      var sourceKey = /(file|src|url|hls|m3u8|manifest|source|playlist|contenturl|stream|video|mp4|webm)/i;
+      var sourceKey = /(file|src|url|uri|link|download|path|endpoint|playback|hls|m3u8|manifest|source|playlist|contenturl|stream|video|mp4|webm|dash|mpd|qualityurl|formaturl)/i;
+      var typeText = String(raw.type || raw.mimeType || raw.mime_type || raw.contentType || raw.content_type || raw.kind || meta.mime || '').toLowerCase();
+      var labelText = String(raw.label || raw.quality || raw.resolution || raw.qualityLabel || meta.label || '').toLowerCase();
+      var hasDimensions = Number(raw.height || raw.videoHeight || raw.width || raw.videoWidth || meta.height || meta.width || 0) > 0;
+      var hasVideoHint = trusted || /video|mpegurl|m3u8|dash|mp4|webm|quicktime/.test(typeText) ||
+        (hasDimensions && !/audio/.test(typeText)) || /^(\d{3,4}\s*p|uhd|hd|sd|4k|2k|qhd|fhd)$/i.test(labelText);
+      var explicitlyAudio = /audio|aac|mp3|opus/.test(typeText);
+      var collectionKey = /^(sources|qualities|formats|renditions|variants|streams|tracks)$/i;
       var keys = Object.keys(raw);
-      for (var k = 0; k < Math.min(keys.length, 120); k++) {
+      for (var k = 0; k < Math.min(keys.length, 240); k++) {
         var key = keys[k];
         if (badKey.test(key)) continue;
         var value = raw[key];
-        if (typeof value === 'string' && sourceKey.test(key)) parsePlayerConfig(value, add, depth + 1);
-        else if (value && typeof value === 'object') parsePlayerConfig(value, add, depth + 1);
+        var keyIsSource = sourceKey.test(key);
+        var keyIsQuality = /^(\d{3,4}p?|2k|4k|qhd|uhd)$/i.test(key);
+        var childVideoContext = !explicitlyAudio && (hasVideoHint || collectionKey.test(key) || keyIsQuality || /^(file|hls|m3u8|manifest|playlist|videoUrl|video_url|contentUrl|content_url)$/i.test(key));
+        var childMeta = mergeQualityMeta(value, meta, keyIsQuality ? key : '');
+        if (typeof value === 'string' && (keyIsSource || (trusted && keyIsQuality))) parsePlayerConfig(value, add, depth + 1, childVideoContext, childMeta, keyIsQuality ? key : '');
+        else if (value && typeof value === 'object') parsePlayerConfig(value, add, depth + 1, childVideoContext, childMeta, keyIsQuality ? key : '');
+      }
+    };
+    var extractPlayerScriptUrls = function(text, add){
+      if (!text || text.length > 900000) return;
+      // JSON configs are handled structurally first.
+      parsePlayerConfig(text, add, 0, false);
+      // Also handle common JS setup syntax that is not valid JSON, but only named media fields.
+      var re = /(?:file|src|url|uri|link|download|downloadUrl|download_url|playbackUrl|playback_url|manifest|hls|m3u8|playlist|videoUrl|video_url|contentUrl|content_url|sourceUrl|source_url|qualityUrl|quality_url)\s*[:=]\s*['\"](https?:\\?\/\/[^'\"]+)['\"]/gi;
+      var match;
+      while ((match = re.exec(text)) !== null) {
+        var candidate = match[1].replace(/\\\//g, '/').replace(/\\u0026/gi, '&');
+        if (isPlayerMediaUrl(candidate, true)) add(candidate);
+      }
+      var qualityMap = /(?:['\"]?(\d{3,4}p?|2k|4k|qhd|uhd)['\"]?)\s*:\s*['\"](https?:\\?\/\/[^'\"]+)['\"]/gi;
+      while ((match = qualityMap.exec(text)) !== null) {
+        var qualityUrl = match[2].replace(/\\\//g, '/').replace(/\\u0026/gi, '&');
+        if (isPlayerMediaUrl(qualityUrl, true)) {
+          var ql = match[1];
+          var qn = /^\d/.test(ql) ? Number(ql.match(/\d+/)[0]) : (/^(2k|qhd)$/i.test(ql) ? 1440 : 2160);
+          add(qualityUrl, {label: ql, height: qn});
+        }
       }
     };
     var collectSources = function(v){
       var out = [];
       var seen = Object.create(null);
-      var add = function(raw){
+      var sourceMeta = Object.create(null);
+      var add = function(raw, meta){
         var u = absUrl(raw);
-        if (!isHttp(u) || isAdUrl(u) || isChunkUrl(u) || !isMediaUrl(u) || seen[u]) return;
-        seen[u] = true;
-        out.push(u);
+        if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
+        var incoming = mergeQualityMeta(null, meta || {}, '');
+        if (!seen[u]) { seen[u] = true; out.push(u); }
+        var existing = sourceMeta[u] || {};
+        if (incoming.label && (!existing.label || !/\d/.test(existing.label))) existing.label = incoming.label;
+        if (incoming.width && !existing.width) existing.width = incoming.width;
+        if (incoming.height && !existing.height) existing.height = incoming.height;
+        if (incoming.mime && !existing.mime) existing.mime = incoming.mime;
+        sourceMeta[u] = existing;
       };
       // 1) إعدادات المحتوى المسبقة على عنصر الفيديو والحاويات القريبة.
       var n = v;
@@ -189,13 +282,14 @@ private const val SCAN_JS = """
         var attrs = [
           'data-src','data-file','data-video','data-video-url','data-content-url',
           'data-hls','data-m3u8','data-manifest','data-stream-url','data-file-url',
+          'data-sources','data-renditions','data-formats','data-qualities',
           'data-player-config','data-setup','data-config','data-options'
         ];
         for (var a = 0; a < attrs.length; a++) {
           var attrValue = n.getAttribute(attrs[a]);
           if (!attrValue) continue;
-          if (attrs[a].indexOf('config') >= 0 || attrs[a] === 'data-setup' || attrs[a] === 'data-options') {
-            parsePlayerConfig(attrValue, add, 0);
+          if (/(config|setup|options|sources|renditions|formats|qualities)/i.test(attrs[a])) {
+            parsePlayerConfig(attrValue, add, 0, true);
           } else add(attrValue);
         }
         var cls = typeof n.className === 'string' ? n.className : '';
@@ -205,29 +299,267 @@ private const val SCAN_JS = """
           break;
         }
       }
-      // 2) مصادر source داخل عنصر الفيديو أو حاوية المشغل فقط، مع تجاهل الصوت.
-      var children = v.querySelectorAll ? v.querySelectorAll('source[src],source[data-src]') : [];
-      for (var i = 0; i < Math.min(children.length, 12); i++) {
+      // 2) مصادر source داخل الفيديو أو حاوية المشغل، بما فيها عناصر الجودة البديلة.
+      var children = playerRoot && playerRoot.querySelectorAll ? playerRoot.querySelectorAll('source[src],source[data-src]') :
+        (v.querySelectorAll ? v.querySelectorAll('source[src],source[data-src]') : []);
+      for (var i = 0; i < Math.min(children.length, 80); i++) {
         var childType = (children[i].getAttribute('type') || '').toLowerCase();
         if (!childType || childType.indexOf('video/') === 0 || childType.indexOf('application/vnd.apple.mpegurl') === 0) {
-          add(children[i].getAttribute('src') || children[i].getAttribute('data-src'));
+          add(children[i].getAttribute('src') || children[i].getAttribute('data-src'), {mime: childType});
         }
+      }
+      var qualityNodes = playerRoot && playerRoot.querySelectorAll ?
+        playerRoot.querySelectorAll('[data-quality-url],[data-quality][data-url],[data-resolution][data-url],[data-height][data-src],[data-file][data-quality],option[value]') : [];
+      for (var qn = 0; qn < Math.min(qualityNodes.length, 80); qn++) {
+        var qel = qualityNodes[qn];
+        var qurl = qel.getAttribute('data-quality-url') || qel.getAttribute('data-url') ||
+          qel.getAttribute('data-src') || qel.getAttribute('data-file') || qel.value || '';
+        if (!qurl) continue;
+        var qheight = Number(qel.getAttribute('data-height') || qel.getAttribute('data-resolution') || 0);
+        var qlabel = qel.getAttribute('data-quality') || qel.getAttribute('label') || qel.textContent || '';
+        parsePlayerConfig({src:qurl, type:'video', height:qheight, quality:qlabel}, add, 0, true);
       }
       // 3) إعداد JSON/VideoObject داخل نطاق المشغل، وليس جميع روابط الصفحة عشوائيًا.
       var scripts = playerRoot && playerRoot.querySelectorAll ? playerRoot.querySelectorAll('script[type="application/json"],script[type="application/ld+json"],script[id*="player" i],script[id*="video" i],[data-player-config]') : [];
-      for (var j = 0; j < Math.min(scripts.length, 12); j++) {
+      for (var j = 0; j < Math.min(scripts.length, 32); j++) {
         var text = scripts[j].textContent || scripts[j].getAttribute('data-player-config') || '';
-        if (text.length < 500000) parsePlayerConfig(text, add, 0);
+        extractPlayerScriptUrls(text, add);
       }
       // 4) بيانات VideoObject وOpen Graph على الصفحة، وهي مفيدة قبل بدء الإعلان.
       var ld = document.querySelectorAll('script[type="application/ld+json"]');
       for (var x = 0; x < Math.min(ld.length, 8); x++) {
         var ldText = ld[x].textContent || '';
         if (!/VideoObject/i.test(ldText) || ldText.length > 500000) continue;
-        parsePlayerConfig(ldText, add, 0);
+        extractPlayerScriptUrls(ldText, add);
       }
       var metas = document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"]');
       for (var m = 0; m < Math.min(metas.length, 4); m++) add(metas[m].content);
+      // 5) كثير من المواقع تضع إعداد المشغل في script عام خارج عنصر player نفسه.
+      // نفحص عددًا محدودًا من scripts التي تحمل مؤشرات إعدادات فيديو فقط، ولا نفحص كل نصوص الصفحة.
+      var globalScripts = document.querySelectorAll('script:not([src])');
+      var inspected = 0;
+      for (var gs = 0; gs < globalScripts.length && inspected < 32; gs++) {
+        var scriptText = globalScripts[gs].textContent || '';
+        if (scriptText.length < 20 || scriptText.length > 900000 ||
+            !/(jwplayer|videojs|sources|qualities|renditions|m3u8|hls|manifest|videoUrl|contentUrl|\\.mp4)/i.test(scriptText)) continue;
+        inspected++;
+        extractPlayerScriptUrls(scriptText, add);
+      }
+      // 6) Read common globally exposed player state containers. Limit to named roots and
+      // player-specific subtrees so unrelated page links are not treated as video qualities.
+      try {
+        var configRoots = ['__PLAYER_CONFIG__','playerConfig','videoConfig','videoData','__VIDEO_DATA__',
+          '__PLAYER_DATA__','initialPlayerConfig','playerData','videoSources','__VIDEO_PLAYER__'];
+        for (var cr = 0; cr < configRoots.length; cr++) {
+          var configValue = window[configRoots[cr]];
+          if (configValue) parsePlayerConfig(configValue, add, 0, true);
+        }
+        var nextData = window.__NEXT_DATA__;
+        if (nextData && nextData.props && nextData.props.pageProps) {
+          var pageProps = nextData.props.pageProps;
+          ['video','player','media','playback','stream','sources'].forEach(function(k){
+            if (pageProps[k]) parsePlayerConfig(pageProps[k], add, 0, true);
+          });
+        }
+        var nuxtData = window.__NUXT__;
+        if (nuxtData && typeof nuxtData === 'object') {
+          ['video','player','media','playback','stream','sources'].forEach(function(k){
+            if (nuxtData[k]) parsePlayerConfig(nuxtData[k], add, 0, true);
+          });
+        }
+      } catch (_) {}
+      // 7) Dynamic API payloads: wrap fetch/XHR once and inspect only bounded text/JSON
+      // responses that look like player metadata or manifests. Binary media is never read here.
+      try {
+        if (!window.__vbApiObserverInstalled) {
+          window.__vbApiObserverInstalled = true;
+          window.__vbApiPayloads = [];
+          var rememberPayload = function(requestUrl, text, contentType){
+            try {
+              if (!text || text.length > 1000000 || isAdUrl(requestUrl)) return;
+              var relevant = /#EXTM3U|(?:sources|qualities|renditions|formats|m3u8|mpd|video_url|videoUrl|contentUrl|resolution|height|playbackUrl)/i.test(text);
+              if (!relevant) return;
+              var list = window.__vbApiPayloads || (window.__vbApiPayloads = []);
+              var absoluteRequestUrl = String(requestUrl || location.href);
+              try { absoluteRequestUrl = new URL(absoluteRequestUrl, location.href).href; } catch (_) {}
+              var key = absoluteRequestUrl + '|' + text.length + '|' + text.substring(0, 96);
+              if (list.some(function(x){ return x.key === key; })) return;
+              list.push({key:key, url:absoluteRequestUrl, text:text, at:Date.now(), type:String(contentType || '')});
+              while (list.length > 24) list.shift();
+            } catch (_) {}
+          };
+          if (typeof window.fetch === 'function') {
+            var originalFetch = window.fetch;
+            window.fetch = function(input, init){
+              var requestUrl = typeof input === 'string' ? input : (input && input.url) || '';
+              return originalFetch.apply(this, arguments).then(function(response){
+                try {
+                  var ct = response.headers ? (response.headers.get('content-type') || '') : '';
+                  var path = String(requestUrl).toLowerCase();
+                  if (/json|text|xml|mpegurl|dash\+xml/i.test(ct) || /\.(m3u8|mpd)(?:[?#]|$)/i.test(path)) {
+                    response.clone().text().then(function(text){ rememberPayload(requestUrl, text, ct); }).catch(function(){});
+                  }
+                } catch (_) {}
+                return response;
+              });
+            };
+          }
+          if (window.XMLHttpRequest) {
+            var OriginalXHR = window.XMLHttpRequest;
+            var WrappedXHR = function(){
+              var xhr = new OriginalXHR();
+              var requestUrl = '';
+              var oldOpen = xhr.open;
+              xhr.open = function(method, url){ requestUrl = String(url || ''); return oldOpen.apply(xhr, arguments); };
+              xhr.addEventListener('load', function(){
+                try {
+                  var ct = xhr.getResponseHeader('content-type') || '';
+                  var body = '';
+                  if (xhr.responseType === '' || xhr.responseType === 'text') body = xhr.responseText || '';
+                  else if (xhr.responseType === 'json' && xhr.response) body = JSON.stringify(xhr.response);
+                  if (body && (/json|text|xml|mpegurl|dash\+xml/i.test(ct) || /\.(m3u8|mpd)(?:[?#]|$)/i.test(requestUrl))) {
+                    rememberPayload(requestUrl, body, ct);
+                  }
+                } catch (_) {}
+              });
+              return xhr;
+            };
+            WrappedXHR.prototype = OriginalXHR.prototype;
+            try { Object.setPrototypeOf(WrappedXHR, OriginalXHR); } catch (_) {}
+            window.XMLHttpRequest = WrappedXHR;
+          }
+        }
+      } catch (_) {}
+      var parseHlsAttributes = function(raw){
+        var attrs = Object.create(null);
+        var i = 0;
+        while (i < String(raw || '').length) {
+          while (i < raw.length && (raw[i] === ',' || /\s/.test(raw[i]))) i++;
+          var start = i;
+          while (i < raw.length && raw[i] !== '=' && raw[i] !== ',') i++;
+          if (i >= raw.length || raw[i] !== '=') break;
+          var key = raw.substring(start, i).trim().toUpperCase();
+          i++;
+          var value = '';
+          if (raw[i] === '"') {
+            i++;
+            var valueStart = i;
+            while (i < raw.length && raw[i] !== '"') i++;
+            value = raw.substring(valueStart, i);
+            if (i < raw.length) i++;
+          } else {
+            var plainStart = i;
+            while (i < raw.length && raw[i] !== ',') i++;
+            value = raw.substring(plainStart, i).trim();
+          }
+          if (key) attrs[key] = value;
+          while (i < raw.length && raw[i] !== ',') i++;
+        }
+        return attrs;
+      };
+      var apiPayloads = window.__vbApiPayloads || [];
+      for (var ap = Math.max(0, apiPayloads.length - 24); ap < apiPayloads.length; ap++) {
+        var payload = apiPayloads[ap];
+        if (!payload || Date.now() - payload.at > 180000 || isAdUrl(payload.url)) continue;
+        var body = payload.text || '';
+        if (/^\s*#EXTM3U/m.test(body)) {
+          var lines = body.split(/\r?\n/);
+          var waitingVariant = null;
+          for (var li = 0; li < lines.length; li++) {
+            var line = lines[li].trim();
+            if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
+              waitingVariant = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+              continue;
+            }
+            if (waitingVariant && line && line.charAt(0) !== '#') {
+              var variantUrl = absUrl(new URL(line, payload.url).href);
+              var resolution = String(waitingVariant.RESOLUTION || '');
+              var dims = /^(\d{2,5})x(\d{2,5})$/i.exec(resolution);
+              var variantHeight = dims ? Number(dims[2]) : 0;
+              var variantWidth = dims ? Number(dims[1]) : 0;
+              var variantLabel = waitingVariant.NAME || (variantHeight ? variantHeight + 'p' : '');
+              add(variantUrl, {
+                mime:'application/vnd.apple.mpegurl',
+                label:variantLabel,
+                width:variantWidth,
+                height:variantHeight
+              });
+              waitingVariant = null;
+            }
+            if (line.indexOf('#EXT-X-MEDIA:') === 0) {
+              var mediaAttrs = parseHlsAttributes(line.substring(line.indexOf(':') + 1));
+              if (String(mediaAttrs.TYPE || '').toUpperCase() === 'VIDEO' && mediaAttrs.URI) {
+                var mediaResolution = String(mediaAttrs.RESOLUTION || '');
+                var mediaDims = /^(\d{2,5})x(\d{2,5})$/i.exec(mediaResolution);
+                var mediaHeight = mediaDims ? Number(mediaDims[2]) : 0;
+                var mediaWidth = mediaDims ? Number(mediaDims[1]) : 0;
+                add(absUrl(new URL(mediaAttrs.URI, payload.url).href), {
+                  mime:'application/vnd.apple.mpegurl',
+                  label:mediaAttrs.NAME || (mediaHeight ? mediaHeight + 'p' : ''),
+                  width:mediaWidth,
+                  height:mediaHeight
+                });
+              }
+            }
+          }
+          // The API endpoint itself may be an HLS master/media playlist even when its
+          // URL is opaque and has no .m3u8 suffix. Preserve it as a manifest source.
+          add(payload.url, {mime:'application/vnd.apple.mpegurl'});
+        } else {
+          try {
+            var parsedPayload = JSON.parse(body);
+            parsePlayerConfig(parsedPayload, add, 0, true);
+          } catch (_) {
+            extractPlayerScriptUrls(body, add);
+          }
+        }
+      }
+      // 8) Known player adapters: prefer actual quality representations from the player instance.
+      try {
+        if (typeof window.videojs === 'function' && window.videojs.getPlayers) {
+          var vplayers = window.videojs.getPlayers() || {};
+          var vkeys = Object.keys(vplayers);
+          for (var vp = 0; vp < Math.min(vkeys.length, 8); vp++) {
+            try {
+              var vplayer = vplayers[vkeys[vp]];
+              if (!vplayer) continue;
+              if (vplayer.currentSources) parsePlayerConfig(vplayer.currentSources(), add, 0, true);
+              if (vplayer.currentSource) parsePlayerConfig(vplayer.currentSource(), add, 0, true);
+              var tech = vplayer.tech ? vplayer.tech(true) : null;
+              var vhs = tech && (tech.vhs || tech.hls);
+              if (vhs && vhs.playlists && vhs.playlists.master) parsePlayerConfig(vhs.playlists.master, add, 0, true);
+              if (vhs && vhs.representations) parsePlayerConfig(vhs.representations(), add, 0, true);
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      try {
+        var hlsNames = ['hls','__hls','hlsPlayer','playerHls','__playerHls'];
+        for (var hn = 0; hn < hlsNames.length; hn++) {
+          var hlsInstance = window[hlsNames[hn]];
+          if (hlsInstance && Array.isArray(hlsInstance.levels)) parsePlayerConfig(hlsInstance.levels, add, 0, true);
+        }
+      } catch (_) {}
+      // 9) Known player adapters: prefer the current playlist/config object, not arbitrary page URLs.
+      try {
+        if (typeof window.jwplayer === 'function') {
+          var jwNodes = playerRoot && playerRoot.querySelectorAll ? playerRoot.querySelectorAll('[id]') : [];
+          var jwIds = [];
+          if (playerRoot && playerRoot.id) jwIds.push(playerRoot.id);
+          for (var ji = 0; ji < Math.min(jwNodes.length, 8); ji++) {
+            var jid = jwNodes[ji].id;
+            if (jid && /jw|player|video/i.test(jid) && jwIds.indexOf(jid) < 0) jwIds.push(jid);
+          }
+          if (!jwIds.length) jwIds.push('');
+          for (var jx = 0; jx < jwIds.length; jx++) {
+            try {
+              var jw = window.jwplayer(jwIds[jx] || undefined);
+              if (jw && jw.getConfig) parsePlayerConfig(jw.getConfig(), add, 0, true);
+              if (jw && jw.getPlaylistItem) parsePlayerConfig(jw.getPlaylistItem(), add, 0, true);
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
       // currentSrc/src قد يتحولان مؤقتًا إلى ملف الإعلان؛ لا نضيفهما أثناء وضع الإعلان.
       // وإذا لم يكشف المشغل أي بديل وكان المصدر قصيرًا جدًا، نؤجّل اعتباره محتوى حتى يحدث انتقال.
       var currentSrc = absUrl(v.currentSrc || v.getAttribute('src') || '');
@@ -239,10 +571,14 @@ private const val SCAN_JS = """
       var shortUnclassifiedSource = currentDuration > 0 && currentDuration <= 12 &&
         (out.length === 0 || hasAlternativeSource) && !v.__vbContentTransition;
       if (!adNow && !shortUnclassifiedSource) {
-        add(v.getAttribute('src'));
-        add(v.currentSrc);
+        add(v.getAttribute('src'), {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
+        add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
-      return out.slice(0, 24);
+      v.__vbSourceMeta = out.slice(0, 128).map(function(u){
+        var m = sourceMeta[u] || {};
+        return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || ''};
+      });
+      return out.slice(0, 128);
     };
     var makeId = function(v){
       if (!v.__vbId) v.__vbId = Math.random().toString(36).slice(2);
@@ -284,7 +620,7 @@ private const val SCAN_JS = """
           window.VBVideoGesture.onVideoEvent(
             id, key, !!ad, String(eventName || 'scan'), duration,
             Number(v.__vbSourceEpoch || 0), Number(v.__vbCycle || 0),
-            JSON.stringify(sources), !!adContainer
+            JSON.stringify(sources), !!adContainer, JSON.stringify(v.__vbSourceMeta || [])
           );
         }
       } catch (_) {}
@@ -415,7 +751,7 @@ private const val SCAN_JS = """
       var pKey = psrc + '||' + pSources.join('||');
       if (pKey !== pv.__vbSourceKey) emit(pv, 'scan');
       primary = {
-        id: makeId(pv), src: psrc, sources: pSources,
+        id: makeId(pv), src: psrc, sources: pSources, sourceMeta: pv.__vbSourceMeta || [],
         sourceKey: pKey, sourceEpoch: Number(pv.__vbSourceEpoch || 0),
         cycle: Number(pv.__vbCycle || 0), ad: !!pad,
         adContainer: hasAdMarker(pv) || hasVisibleAdOverlay(pv), poster: absUrl(pv.poster || ''),
@@ -481,7 +817,7 @@ class MainActivity : AppCompatActivity() {
 
     class VideoGestureBridge(
         private val onGesture: (String) -> Unit,
-        private val onVideoEvent: (String, String, Boolean, String, Double, Int, Int, String, Boolean) -> Unit
+        private val onVideoEvent: (String, String, Boolean, String, Double, Int, Int, String, Boolean, String) -> Unit
     ) {
         @JavascriptInterface
         fun onVideoGesture(videoId: String?) {
@@ -492,14 +828,16 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onVideoEvent(
             videoId: String?, sourceKey: String?, isAd: Boolean, eventName: String?,
-            duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String?, adContainer: Boolean
+            duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String?, adContainer: Boolean,
+            sourceMetaJson: String?
         ) {
             val id = videoId?.take(100)?.trim().orEmpty()
             if (id.isNotEmpty()) {
                 onVideoEvent(
                     id, sourceKey?.take(12000).orEmpty(), isAd,
                     eventName?.take(40).orEmpty(), duration,
-                    sourceEpoch, cycle, sourcesJson?.take(16000).orEmpty(), adContainer
+                    sourceEpoch, cycle, sourcesJson?.take(16000).orEmpty(), adContainer,
+                    sourceMetaJson?.take(24000).orEmpty()
                 )
             }
         }
@@ -902,8 +1240,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             },
-            onVideoEvent = { id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer ->
-                handleVideoEvent(tab, id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer)
+            onVideoEvent = { id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer, sourceMetaJson ->
+                handleVideoEvent(tab, id, key, isAd, event, duration, epoch, cycle, sourcesJson, adContainer, sourceMetaJson)
             }
         ), "VBVideoGesture")
 
@@ -1031,8 +1369,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isHlsUrl(raw: String): Boolean {
-        val path = Uri.parse(raw).path.orEmpty().lowercase()
-        return path.endsWith(".m3u8")
+        val uri = Uri.parse(raw)
+        val path = uri.path.orEmpty().lowercase()
+        if (path.endsWith(".m3u8")) return true
+        val hints = setOf("type", "mime", "mimetype", "contenttype", "format", "response-content-type")
+        return uri.queryParameterNames.any { key ->
+            key.lowercase() in hints && (uri.getQueryParameter(key) ?: "").lowercase().let {
+                it.contains("mpegurl") || it.contains("m3u8")
+            }
+        }
     }
 
     private fun isCandidateMediaRequest(raw: String): Boolean {
@@ -1048,7 +1393,31 @@ class MainActivity : AppCompatActivity() {
         if (path.contains("/videoplayback")) {
             return uri.getQueryParameter("sq") == null && uri.getQueryParameter("range") == null
         }
+        // بعض مشغلات المواقع تستخدم روابط CDN بلا امتداد ملف، وتضع الجودة أو MIME في query.
+        // لا نقبلها إلا بوجود حقل يدل صراحة على تمثيل فيديو.
+        val videoParamNames = setOf("mime", "mimetype", "contenttype", "type", "format", "itag", "quality", "resolution", "height", "video")
+        val hasVideoParam = uri.queryParameterNames.any { it.lowercase() in videoParamNames }
+        val querySignalsVideo = uri.queryParameterNames.any { name ->
+            val n = name.lowercase()
+            if (n !in videoParamNames) false else {
+                val value = (uri.getQueryParameter(name) ?: "").lowercase()
+                n in setOf("mime", "mimetype", "contenttype", "type", "format") &&
+                    (value.contains("video") || value.contains("mp4") || value.contains("webm") || value.contains("mpegurl")) ||
+                    n in setOf("itag", "quality", "resolution", "height", "video")
+            }
+        }
+        if (hasVideoParam && querySignalsVideo) return true
         return false
+    }
+
+    /** مصدر قادم مباشرة من إعدادات مشغل الفيديو/عنصره؛ قد يكون endpoint بلا امتداد. */
+    private fun isCandidatePlayerSource(raw: String): Boolean {
+        if (!raw.startsWith("http://", true) && !raw.startsWith("https://", true)) return false
+        if (isExcludedMediaUrl(raw) || isStreamingChunkRequest(raw)) return false
+        if (isCandidateMediaRequest(raw)) return true
+        val path = Uri.parse(raw).path.orEmpty().lowercase()
+        if (Regex("\\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|js|json|vtt|srt|woff2?|ttf|otf)$").containsMatchIn(path)) return false
+        return true
     }
 
     private fun resetVideoSession(t: Tab) {
@@ -1086,13 +1455,25 @@ class MainActivity : AppCompatActivity() {
                 .filter { it.videoId == id && it.sourceEpoch == t.primarySourceEpoch && now - it.requestedAt in 0L..180_000L }
                 .forEach { captured ->
                     if (isCandidateMediaRequest(captured.url)) {
-                        val origin = if (captured.capturedDuringAd) "network-pending-ad" else "network"
+                        // لا تسمح لالتقاط الشبكة الخام بأن يمحو بيانات الجودة التي استخرجناها
+                        // مسبقًا من إعدادات المشغل لنفس الرابط (خصوصًا signed URLs بلا امتداد).
+                        val prepared = t.preparedMedia[captured.url] ?: t.media[captured.url]
+                        val origin = when {
+                            prepared?.origin == "dom-preroll" -> "dom-preroll"
+                            prepared?.origin == "dom" -> "dom"
+                            captured.capturedDuringAd -> "network-pending-ad"
+                            else -> "network"
+                        }
                         t.media[captured.url] = MediaItem(
                             captured.url,
-                            if (isHlsUrl(captured.url)) "hls" else "direct",
+                            prepared?.type ?: if (isHlsUrl(captured.url)) "hls" else "direct",
                             origin,
                             id,
-                            captured.sourceEpoch
+                            captured.sourceEpoch,
+                            prepared?.qualityHint.orEmpty(),
+                            prepared?.widthHint ?: 0,
+                            prepared?.heightHint ?: 0,
+                            prepared?.mimeHint.orEmpty()
                         )
                     }
                 }
@@ -1105,7 +1486,7 @@ class MainActivity : AppCompatActivity() {
         val id = t.primaryVideoId.orEmpty()
         val sources = t.media.values
             .sortedBy { it.url }
-            .joinToString("\n") { "${it.origin}|${it.type}|${it.url}" }
+            .joinToString("\n") { "${it.origin}|${it.type}|${it.url}|${it.qualityHint}|${it.widthHint}x${it.heightHint}|${it.mimeHint}" }
         return "$id|${t.primarySourceEpoch}|${t.primaryCurrentSrc}|${t.primaryIsAd}|${t.suspectedPreroll}|${"%.1f".format(java.util.Locale.US, t.expectedDurationSec)}|$sources"
     }
 
@@ -1135,45 +1516,64 @@ class MainActivity : AppCompatActivity() {
             d > 20.0 && (expectedDuration !in 1.0..12.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0))
         }
 
-        val usable = groups.filter { (item, formats) ->
-            val d = duration(formats)
-            val pendingAdRequest = item.origin == "network-pending-ad"
-
-            when {
-                // Requests captured during the ad window are only promoted when the response
-                // itself proves it is a long HLS media list. Direct files have no reliable
-                // duration metadata here, so they are not guessed to be the movie.
-                pendingAdRequest -> d > 20.0 && when {
-                    expectedDuration > 20.0 -> abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
-                    expectedDuration in 1.0..12.0 -> d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+        val usable = groups.mapNotNull { (item, formats) ->
+            val requiresNetworkDurationProof = item.origin == "network-pending-ad"
+            val isPredeclaredPlayerSource = item.origin == "dom-preroll"
+            val checkedFormats = formats.filter { format ->
+                val d = format.durSec.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
+                val rank = qualityRank(format.label)
+                when {
+                    // Network requests seen during an ad are ambiguous. Keep them only
+                    // when the media metadata proves they are long-form content.
+                    requiresNetworkDurationProof -> d > 20.0 && when {
+                        expectedDuration > 20.0 -> abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
+                        expectedDuration in 1.0..12.0 -> d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                        else -> true
+                    }
+                    // A URL explicitly listed by the player's own quality/config object
+                    // is stronger evidence than an arbitrary ad-period network request.
+                    // If duration metadata is unavailable, accept it only when its URL or
+                    // player label exposes a concrete quality and it is not the ad currentSrc.
+                    isPredeclaredPlayerSource -> item.url != currentSrc && (
+                        (d > 20.0 && (expectedDuration <= 20.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12))) ||
+                            (d <= 0.0 && rank > 0)
+                        )
+                    isAdOrPreroll -> item.origin == "dom" && item.url != currentSrc && (
+                        (d > 20.0 && (expectedDuration <= 20.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12))) ||
+                            (d <= 0.0 && rank > 0)
+                        )
+                    expectedDuration > 20.0 -> d <= 0.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
+                    expectedDuration in 1.0..12.0 && hasLongAlternative ->
+                        d <= 0.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                    expectedDuration <= 0.0 && longest > 20.0 -> d <= 0.0 || d >= maxOf(20.0, longest * 0.35)
                     else -> true
                 }
-                // While an ad/preroll is active, never offer the current source. A different
-                // source predeclared by this player's DOM/config may be the movie's direct
-                // MP4 quality and often has no duration until playback; allow it after URL
-                // ad/preview filtering. HLS alternatives still require a credible long duration.
-                isAdOrPreroll -> item.origin == "dom" && item.url != currentSrc && (
-                    (item.type == "direct" && d <= 0.0) ||
-                    (d > 20.0 && (expectedDuration <= 20.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)))
-                )
-                expectedDuration > 20.0 -> d <= 0.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
-                expectedDuration in 1.0..12.0 && hasLongAlternative -> d <= 0.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
-                expectedDuration <= 0.0 && longest > 20.0 -> d <= 0.0 || d >= maxOf(20.0, longest * 0.35)
-                else -> true
             }
+            if (checkedFormats.isEmpty()) null else item to checkedFormats
         }
 
+
         if (usable.isEmpty()) return emptyList()
-        val masterGroup = usable
-            .filter { (_, formats) -> formats.any { it.fromMaster && !it.isAudio } }
-            .maxByOrNull { (_, formats) -> formats.count { it.fromMaster && !it.isAudio } }
-        val chosen = if (masterGroup != null) listOf(masterGroup) else usable
-        return chosen.flatMap { it.second }
+        // اجمع تمثيلات الجودة من جميع المصادر المرتبطة بمشغل الفيديو.
+        // لا تختَر مجموعة HLS واحدة وتُسقط بقية روابط MP4/WEBM المنفصلة؛ بعض المواقع
+        // تعرض master منخفضًا بينما تحفظ 480p/720p/1080p في مصادر مستقلة.
+        val allFormats = usable.flatMap { it.second }
             .filter { format ->
                 !format.isAudio && !Formats.isAudio(format.ext) && !isExcludedMediaUrl(format.url) &&
                     (format.kind == "hls" || Util.kindOf("x." + format.ext) == "video")
             }
             .distinctBy { it.url }
+        // عند وجود أكثر من URL لنفس الدقة، احتفظ بأعلى تمثيل مقدّر بالحجم، ولا تحذف دقات أخرى.
+        return allFormats
+            .groupBy { format ->
+                val rank = qualityRank(format.label)
+                if (rank > 0) "height:$rank" else "url:${format.url}"
+            }
+            .values
+            .mapNotNull { candidates -> candidates.maxWithOrNull(
+                compareBy<Format> { if (it.bytes > 0) it.bytes else -1L }
+                    .thenBy { if (it.fromMaster) 1 else 0 }
+            ) }
             .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
     }
 
@@ -1192,9 +1592,14 @@ class MainActivity : AppCompatActivity() {
         val expectedDuration = t.expectedDurationSec
         val currentSrc = t.primaryCurrentSrc
         val blockedAsAd = t.primaryIsAd || t.suspectedPreroll
-        val items = t.media.values
-            .sortedWith(compareBy<MediaItem> { if (it.origin == "dom") 0 else 1 }.thenBy { if (it.type == "hls") 0 else 1 })
-            .take(24)
+        val items = t.media.values.map { item ->
+            if (blockedAsAd && item.origin == "dom") {
+                MediaItem(item.url, item.type, "dom-preroll", item.videoId, item.sourceEpoch,
+                    item.qualityHint, item.widthHint, item.heightHint, item.mimeHint)
+            } else item
+        }.sortedWith(compareBy<MediaItem> { if (it.origin == "dom" || it.origin == "dom-preroll") 0 else 1 }
+            .thenBy { if (it.type == "hls") 0 else 1 })
+            .take(96)
         val headers = headersFor(t)
         t.resolvingKey = key
         io.execute {
@@ -1211,11 +1616,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun addPreparedSource(t: Tab, url: String, videoId: String) {
+    private fun addPreparedSource(t: Tab, url: String, videoId: String, meta: JSONObject? = null) {
         if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return
-        if (!isCandidateMediaRequest(url)) return
-        val type = if (isHlsUrl(url)) "hls" else "direct"
-        t.preparedMedia[url] = MediaItem(url, type, "dom", videoId, t.primarySourceEpoch)
+        if (!isCandidatePlayerSource(url)) return
+        val type = if (isHlsUrl(url) || meta?.optString("mime", "")?.contains("mpegurl", true) == true) "hls" else "direct"
+        val origin = if (t.primaryIsAd || t.suspectedPreroll) "dom-preroll" else "dom"
+        val previous = t.preparedMedia[url]
+        val quality = meta?.optString("label")?.takeIf { it.isNotBlank() } ?: previous?.qualityHint.orEmpty()
+        val width = meta?.optInt("width", 0)?.takeIf { it > 0 } ?: previous?.widthHint ?: 0
+        val height = meta?.optInt("height", 0)?.takeIf { it > 0 } ?: previous?.heightHint ?: 0
+        val mime = meta?.optString("mime")?.takeIf { it.isNotBlank() } ?: previous?.mimeHint.orEmpty()
+        t.preparedMedia[url] = MediaItem(
+            url, type, origin, videoId, t.primarySourceEpoch,
+            quality, width, height, mime
+        )
     }
 
     private fun promotePageRequests(t: Tab, id: String, epoch: Int, isAd: Boolean) {
@@ -1232,12 +1646,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun promotePendingSniffed(t: Tab, id: String, epoch: Int) {
         val now = System.currentTimeMillis()
-        t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
+        t.pendingSniffed.entries.removeAll { now - it.value !in 0L..180_000L }
         t.pendingSniffed.forEach { (url, time) ->
-            // A complete HLS playlist can be checked against the post-ad content duration.
-            // A direct MP4 captured during the ad window has no reliable duration here and
-            // is deliberately not promoted, to avoid offering the ad as the movie.
-            if (now - time <= 120_000L && isHlsUrl(url) && isCandidateMediaRequest(url)) {
+            // لا نسقط روابط MP4/المصادر المنفصلة التي جهزها المشغل قبل انتهاء الإعلان.
+            // يتم التحقق من مدة الملف المباشر ونوعه لاحقًا في Formats.resolve قبل عرضه.
+            if (now - time <= 180_000L && isCandidateMediaRequest(url) && !isExcludedMediaUrl(url)) {
                 t.sniffed[url] = SniffedMedia(url, time, id, epoch, true)
             }
         }
@@ -1250,7 +1663,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleVideoEvent(
         t: Tab, id: String, sourceKey: String, isAd: Boolean, event: String,
-        duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String, adContainer: Boolean
+        duration: Double, sourceEpoch: Int, cycle: Int, sourcesJson: String, adContainer: Boolean,
+        sourceMetaJson: String
     ) {
         ui.post {
             if (tabs.none { it === t }) return@post
@@ -1283,7 +1697,19 @@ class MainActivity : AppCompatActivity() {
             if (sourcesJson.isNotBlank()) {
                 try {
                     val arr = org.json.JSONArray(sourcesJson)
-                    for (i in 0 until arr.length()) addPreparedSource(t, arr.optString(i), id)
+                    val metaByUrl = HashMap<String, JSONObject>()
+                    if (sourceMetaJson.isNotBlank()) {
+                        val metaArr = org.json.JSONArray(sourceMetaJson)
+                        for (mi in 0 until metaArr.length()) {
+                            val meta = metaArr.optJSONObject(mi) ?: continue
+                            val metaUrl = meta.optString("url")
+                            if (metaUrl.isNotBlank()) metaByUrl[metaUrl] = meta
+                        }
+                    }
+                    for (i in 0 until arr.length()) {
+                        val sourceUrl = arr.optString(i)
+                        addPreparedSource(t, sourceUrl, id, metaByUrl[sourceUrl])
+                    }
                 } catch (_: Exception) {
                 }
             }
@@ -1318,7 +1744,7 @@ class MainActivity : AppCompatActivity() {
             // لا نعرض مصادر فترة الإعلان/المصدر القصير غير المصنف، لكن نحتفظ مؤقتًا بالطلبات المرشحة
             // لنربط طلبات المحتوى التي بدأ تحميلها قبل انتقال المشغل من الإعلان إلى الفيلم.
             t.pendingSniffed[url] = now
-            t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
+            t.pendingSniffed.entries.removeAll { now - it.value !in 0L..180_000L }
             while (t.pendingSniffed.size > 100) {
                 val oldest = t.pendingSniffed.keys.firstOrNull() ?: break
                 t.pendingSniffed.remove(oldest)
@@ -1369,6 +1795,7 @@ class MainActivity : AppCompatActivity() {
         val wasPreroll = t.suspectedPreroll
         val nowAd = isAd || adContainer
         val sourcesForContent = p.optJSONArray("sources")
+        val metadataForContent = p.optJSONArray("sourceMeta")
         val suspectedPreroll = p.optBoolean("suspectedPreroll", false) && !nowAd
 
         val primaryChanged = t.primaryVideoId != id
@@ -1407,7 +1834,18 @@ class MainActivity : AppCompatActivity() {
         // JavaScript يستبعد currentSrc عند ظهور علامات الإعلان، بينما يستخرج مصادر المحتوى من config.
         val arr = sourcesForContent
         if (arr != null) {
-            for (i in 0 until arr.length()) addPreparedSource(t, arr.optString(i), id)
+            val metaByUrl = HashMap<String, JSONObject>()
+            if (metadataForContent != null) {
+                for (mi in 0 until metadataForContent.length()) {
+                    val meta = metadataForContent.optJSONObject(mi) ?: continue
+                    val metaUrl = meta.optString("url")
+                    if (metaUrl.isNotBlank()) metaByUrl[metaUrl] = meta
+                }
+            }
+            for (i in 0 until arr.length()) {
+                val sourceUrl = arr.optString(i)
+                addPreparedSource(t, sourceUrl, id, metaByUrl[sourceUrl])
+            }
         }
 
         val a = o.optJSONObject("a")
@@ -1468,10 +1906,8 @@ class MainActivity : AppCompatActivity() {
         toast("بدأ تجهيز جودات الفيديو؛ اضغط مرة أخرى بعد اكتمال التحضير")
     }
 
-    private fun qualityRank(label: String): Int {
-        val match = Regex("(\\d{3,4})\\s*[pP]").find(label)
-        return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-    }
+    private fun qualityRank(label: String): Int =
+        Formats.qualityFromLabel(label) ?: 0
 
     // ---------------------------------------------------------------- شاشة اختيار الجودة
     private fun pathText(): String {
