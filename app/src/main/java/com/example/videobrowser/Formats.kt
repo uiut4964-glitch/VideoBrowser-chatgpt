@@ -11,14 +11,36 @@ object Formats {
     fun isAudio(ext: String): Boolean = ext in setOf("mp3", "m4a", "aac", "ogg", "wav")
 
     fun isAdUrl(raw: String): Boolean {
-        val s = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
-        val lower = s.lowercase(Locale.ROOT)
+        val decoded = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+        val lower = decoded.lowercase(Locale.ROOT)
+        val adHosts = setOf(
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "adsrvr.org", "taboola.com", "outbrain.com", "criteo.com",
+            "pubmatic.com", "rubiconproject.com", "openx.net", "moatads.com",
+            "zedo.com", "adnxs.com", "spotx.tv", "freewheel.tv"
+        )
+        val host = try { java.net.URI(decoded).host?.lowercase(Locale.ROOT).orEmpty() } catch (_: Exception) { "" }
+        if (host.isNotEmpty() && adHosts.any { host == it || host.endsWith("." + it) }) return true
         if (listOf(
                 "doubleclick", "googlesyndication", "googleadservices", "adservice", "adserver",
                 "imasdk", "vasttag", "spotx", "freewheel", "adnxs", "adsystem", "advertising"
             ).any { lower.contains(it) }) return true
+        val pathOrQuery = try {
+            val uri = java.net.URI(decoded)
+            (uri.rawPath.orEmpty() + "?" + uri.rawQuery.orEmpty()).lowercase(Locale.ROOT)
+        } catch (_: Exception) { lower }
         val pattern = Regex("(?:^|[/_.?&=\\-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[/_.?&=\\-]|$)")
-        return pattern.containsMatchIn(lower)
+        return pattern.containsMatchIn(pathOrQuery)
+    }
+
+    fun isPreviewUrl(raw: String): Boolean {
+        val decoded = try { java.net.URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+        val pathAndQuery = try {
+            val uri = java.net.URI(decoded)
+            (uri.rawPath.orEmpty() + "?" + uri.rawQuery.orEmpty()).lowercase(Locale.ROOT)
+        } catch (_: Exception) { decoded.lowercase(Locale.ROOT) }
+        val tokens = Regex("(?:^|[/_.?&=\\-])(preview|previews|thumbnail|thumb|thumbs|poster|trailer|trailers|teaser|teasers|storyboard|sprite)(?:[/_.?&=\\-]|$)")
+        return tokens.containsMatchIn(pathAndQuery)
     }
 
     fun extOf(url: String, mime: String): String {
@@ -82,7 +104,7 @@ object Formats {
 
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
-        if (isAdUrl(item.url)) return out
+        if (isAdUrl(item.url) || isPreviewUrl(item.url)) return out
         if (item.type == "hls") {
             val text = Net.fetchText(item.url, h)
             if (Hls.isMaster(text)) {
@@ -91,7 +113,7 @@ object Formats {
                         .thenByDescending { it.bandwidth }
                 )
                 for (v in vars) {
-                    if (isAdUrl(v.url)) continue
+                    if (isAdUrl(v.url) || isPreviewUrl(v.url)) continue
                     var dur = 0.0
                     var est = -1L
                     var w = 0
@@ -115,7 +137,7 @@ object Formats {
                     if (est <= 0 && v.bandwidth > 0 && dur > 0) est = (v.bandwidth / 8 * dur).toLong()
                     out.add(Format(label, v.resolution, v.url, "hls", "ts", true, fmtEst(est), false, dur, est))
                 }
-                for (a in Hls.parseAudio(text, item.url).filterNot { isAdUrl(it.url) }.take(3)) {
+                for (a in Hls.parseAudio(text, item.url).filterNot { isAdUrl(it.url) || isPreviewUrl(it.url) }.take(3)) {
                     var est = -1L
                     var dur = 0.0
                     try {

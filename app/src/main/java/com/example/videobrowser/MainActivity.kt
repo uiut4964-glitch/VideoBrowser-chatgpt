@@ -80,7 +80,14 @@ private const val SCAN_JS = """
       var s = String(raw || '').toLowerCase();
       try { s = decodeURIComponent(s); } catch (_) {}
       if (/(doubleclick|googlesyndication|googleadservices|adservice|adserver|imasdk|vasttag|spotx|freewheel|adnxs|adsystem|advertising)/i.test(s)) return true;
-      if (/[?&](adtag|adurl|ad_type|adtype|vast|vmap|preroll|midroll|postroll)=/i.test(s)) return true;
+      try {
+        var host = new URL(s, document.baseURI).hostname.toLowerCase();
+        var adHosts = ['doubleclick.net','googlesyndication.com','googleadservices.com','adsrvr.org',
+          'taboola.com','outbrain.com','criteo.com','pubmatic.com','rubiconproject.com','openx.net',
+          'moatads.com','zedo.com','adnxs.com','spotx.tv','freewheel.tv'];
+        if (adHosts.some(function(h){ return host === h || host.endsWith('.' + h); })) return true;
+      } catch (_) {}
+      if (/[?&](ad|adtag|adurl|ad_type|adtype|vast|vmap|preroll|midroll|postroll)=/i.test(s)) return true;
       return /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i.test(s);
     };
     var isChunkUrl = function(raw){
@@ -134,7 +141,9 @@ private const val SCAN_JS = """
       var cs = getComputedStyle(el);
       if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || 1) === 0) return false;
       var r = el.getBoundingClientRect();
-      return r.width >= 70 && r.height >= 45;
+      var iw = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+      var ih = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+      return r.width >= 70 && r.height >= 45 && iw >= 55 && ih >= 35;
     };
     var parsePlayerConfig = function(raw, add, depth){
       if (raw === null || raw === undefined || depth > 8) return;
@@ -220,8 +229,16 @@ private const val SCAN_JS = """
       var metas = document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"]');
       for (var m = 0; m < Math.min(metas.length, 4); m++) add(metas[m].content);
       // currentSrc/src قد يتحولان مؤقتًا إلى ملف الإعلان؛ لا نضيفهما أثناء وضع الإعلان.
-      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(v.currentSrc || v.getAttribute('src') || '');
-      if (!adNow) {
+      // وإذا لم يكشف المشغل أي بديل وكان المصدر قصيرًا جدًا، نؤجّل اعتباره محتوى حتى يحدث انتقال.
+      var currentSrc = absUrl(v.currentSrc || v.getAttribute('src') || '');
+      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(currentSrc);
+      var currentDuration = Number(v.duration || 0);
+      var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });
+      // A short current item plus another source exposed by the same player is a strong
+      // preroll signal: retain the alternative source(s), but do not add the ad currentSrc.
+      var shortUnclassifiedSource = currentDuration > 0 && currentDuration <= 12 &&
+        (out.length === 0 || hasAlternativeSource) && !v.__vbContentTransition;
+      if (!adNow && !shortUnclassifiedSource) {
         add(v.getAttribute('src'));
         add(v.currentSrc);
       }
@@ -234,6 +251,7 @@ private const val SCAN_JS = """
     var emit = function(v, eventName){
       try {
         var id = makeId(v);
+        if (eventName === 'loadstart' || eventName === 'emptied') v.__vbContentTransition = false;
         var src = absUrl(v.currentSrc || v.getAttribute('src') || '');
         var sources = collectSources(v);
         var key = src + '||' + sources.join('||');
@@ -320,6 +338,7 @@ private const val SCAN_JS = """
     var bestAdScore = -1;
     var now = Date.now();
     var active = null;
+    var activeVideoEl = null;
     for (var i = 0; i < videos.length; i++) {
       var v = videos[i];
       makeId(v);
@@ -333,18 +352,21 @@ private const val SCAN_JS = """
           }, true);
         });
       }
-      if (!visible(v)) continue;
       var r = v.getBoundingClientRect();
-      var area = Math.max(0, r.width) * Math.max(0, r.height);
-      if (area < 9000) continue;
+      var inViewport = visible(v);
+      var visibleWidth = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+      var visibleHeight = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+      var area = visibleWidth * visibleHeight;
       var src = absUrl(v.currentSrc || v.getAttribute('src') || '');
       var ad = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v);
-      var sources = collectSources(v);
-      var center = Math.max(0, 1 - Math.abs((r.left + r.width / 2) - (window.innerWidth / 2)) / Math.max(1, window.innerWidth));
-      var score = area * (ad ? 0.90 : 1.0) + area * center * 0.08 + (sources.length ? area * 0.05 : 0);
-      // اختر أكبر فيديو محتوى أولًا؛ لا تسمح لإعلان أكبر قليلًا أن يزيح فيديو المحتوى.
-      if (!ad && score > bestScore) { bestScore = score; bestVideo = v; }
-      if (ad && score > bestAdScore) { bestAdScore = score; bestAdVideo = v; }
+      var sources = (inViewport || v.__vbUserInitiated) ? collectSources(v) : [];
+      if (inViewport && area >= 9000) {
+        var center = Math.max(0, 1 - Math.abs((r.left + r.width / 2) - (window.innerWidth / 2)) / Math.max(1, window.innerWidth));
+        var score = area * (ad ? 0.90 : 1.0) + area * center * 0.08 + (sources.length ? area * 0.05 : 0);
+        // اختر أكبر فيديو محتوى ظاهر في إطار العرض، وليس صورة مصغرة أسفل/خارج الشاشة.
+        if (!ad && score > bestScore) { bestScore = score; bestVideo = v; }
+        if (ad && score > bestAdScore) { bestAdScore = score; bestAdVideo = v; }
+      }
       var tnow = now;
       var ct = Number(v.currentTime || 0);
       var last = v.__vbLastTime;
@@ -354,6 +376,7 @@ private const val SCAN_JS = """
       // نعد ذلك جيل مصدر جديدًا ما لم يكن المستخدم يسحب شريط التقدم.
       var resetAtContentBoundary = playing && last !== undefined && ct + 1.25 < last && !v.seeking && !v.__vbWasSeeking;
       if (resetAtContentBoundary) {
+        v.__vbContentTransition = true;
         v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
         v.__vbCycle = Number(v.__vbCycle || 0) + 1;
         emit(v, 'content-transition');
@@ -361,10 +384,14 @@ private const val SCAN_JS = """
       var advancing = last !== undefined && (tnow - lastAt) >= 300 && ct > last + 0.04;
       v.__vbLastTime = ct;
       v.__vbLastAt = tnow;
-      if (playing && advancing && v.__vbUserInitiated && !ad) {
+      var hasAlternativeSource = sources.some(function(u){ return u !== src; });
+      var shortUnclassifiedSource = Number(v.duration || 0) > 0 && Number(v.duration || 0) <= 12 &&
+        (sources.length === 0 || hasAlternativeSource) && !v.__vbContentTransition;
+      if (playing && advancing && v.__vbUserInitiated && !ad && !shortUnclassifiedSource) {
         var activeScore = Number(v.__vbUserInitiatedAt || 0) + area / 1000000;
         if (!active || activeScore > active.score) {
           active = { id: makeId(v), score: activeScore, src: src, duration: Number(v.duration || 0) };
+          activeVideoEl = v;
         }
       }
       // إذا تغير المصدر ولم يصل حدث DOM لأي سبب، أرسل تحديثًا من دورة الفحص.
@@ -377,9 +404,11 @@ private const val SCAN_JS = """
       }
     }
     var primary = null;
-    if (!bestVideo) bestVideo = bestAdVideo;
-    if (bestVideo) {
-      var pv = bestVideo;
+    // Keep the user-started video as primary even if the user scrolls it out of view.
+    // When nothing is actively playing, use the largest visible content player.
+    var primaryVideo = activeVideoEl || bestVideo || bestAdVideo;
+    if (primaryVideo) {
+      var pv = primaryVideo;
       var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
       var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv);
       var pSources = collectSources(pv);
@@ -391,6 +420,8 @@ private const val SCAN_JS = """
         cycle: Number(pv.__vbCycle || 0), ad: !!pad,
         adContainer: hasAdMarker(pv) || hasVisibleAdOverlay(pv), poster: absUrl(pv.poster || ''),
         duration: Number(pv.duration || 0),
+        suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
+          (pSources.length === 0 || pSources.some(function(u){ return u !== psrc; })) && !pv.__vbContentTransition,
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
       };
     }
@@ -409,7 +440,8 @@ class MainActivity : AppCompatActivity() {
         val url: String,
         val requestedAt: Long,
         val videoId: String,
-        val sourceEpoch: Int
+        val sourceEpoch: Int,
+        val capturedDuringAd: Boolean = false
     )
 
     private class Tab(val web: WebView) {
@@ -427,12 +459,19 @@ class MainActivity : AppCompatActivity() {
         val pageRequests = LinkedHashMap<String, Long>()
         var primaryVideoId: String? = null
         var primarySourceKey = ""
+        var primaryCurrentSrc = ""
         var primarySourceEpoch = 0
         var primaryCycle = 0
         var primaryIsAd = false
+        // A short (<=12s) active source with no exposed alternatives OR with another
+        // predeclared player source is treated as a possible preroll until content transition.
+        var suspectedPreroll = false
         var expectedDurationSec = 0.0
         var sawBlob = false
         @Volatile var activePlayback = false
+        @Volatile var resolvedFormats: List<Format>? = null
+        @Volatile var resolvedKey = ""
+        @Volatile var resolvingKey = ""
         @Volatile var activeId: String? = null
         val userGestureVideoIds = LinkedHashSet<String>()
         @Volatile var userGestureAt = 0L
@@ -796,6 +835,9 @@ class MainActivity : AppCompatActivity() {
         t.sniffed.clear()
         t.pendingSniffed.clear()
         t.pageRequests.clear()
+        t.resolvedFormats = null
+        t.resolvedKey = ""
+        t.resolvingKey = ""
         content.removeView(t.web)
         t.web.destroy()
         if (cur === t) cur = null
@@ -1017,10 +1059,15 @@ class MainActivity : AppCompatActivity() {
         t.pageRequests.clear()
         t.primaryVideoId = null
         t.primarySourceKey = ""
+        t.primaryCurrentSrc = ""
         t.primarySourceEpoch = 0
         t.primaryCycle = 0
         t.primaryIsAd = false
+        t.suspectedPreroll = false
         t.expectedDurationSec = 0.0
+        t.resolvedFormats = null
+        t.resolvedKey = ""
+        t.resolvingKey = ""
         t.activePlayback = false
         t.activeId = null
         t.userGestureVideoIds.clear()
@@ -1032,16 +1079,136 @@ class MainActivity : AppCompatActivity() {
     private fun syncMedia(t: Tab) {
         t.media.clear()
         t.preparedMedia.forEach { (url, item) -> t.media[url] = item }
-        val id = t.primaryVideoId ?: return
-        if (t.primaryIsAd) return
-        val now = System.currentTimeMillis()
-        t.sniffed.values
-            .filter { it.videoId == id && it.sourceEpoch == t.primarySourceEpoch && now - it.requestedAt in 0L..180_000L }
-            .forEach { captured ->
-                if (isCandidateMediaRequest(captured.url)) {
-                    t.media[captured.url] = MediaItem(captured.url, if (isHlsUrl(captured.url)) "hls" else "direct", "network", id, captured.sourceEpoch)
+        val id = t.primaryVideoId
+        if (id != null && !t.primaryIsAd && !t.suspectedPreroll) {
+            val now = System.currentTimeMillis()
+            t.sniffed.values
+                .filter { it.videoId == id && it.sourceEpoch == t.primarySourceEpoch && now - it.requestedAt in 0L..180_000L }
+                .forEach { captured ->
+                    if (isCandidateMediaRequest(captured.url)) {
+                        val origin = if (captured.capturedDuringAd) "network-pending-ad" else "network"
+                        t.media[captured.url] = MediaItem(
+                            captured.url,
+                            if (isHlsUrl(captured.url)) "hls" else "direct",
+                            origin,
+                            id,
+                            captured.sourceEpoch
+                        )
+                    }
                 }
+        }
+        // Prepare qualities in the background, but never use preparation state to color the FAB.
+        scheduleBackgroundResolve(t)
+    }
+
+    private fun resolutionKey(t: Tab): String {
+        val id = t.primaryVideoId.orEmpty()
+        val sources = t.media.values
+            .sortedBy { it.url }
+            .joinToString("\n") { "${it.origin}|${it.type}|${it.url}" }
+        return "$id|${t.primarySourceEpoch}|${t.primaryCurrentSrc}|${t.primaryIsAd}|${t.suspectedPreroll}|${"%.1f".format(java.util.Locale.US, t.expectedDurationSec)}|$sources"
+    }
+
+    private fun resolveQualityGroups(
+        items: List<MediaItem>,
+        headers: Map<String, String>,
+        expectedDuration: Double,
+        isAdOrPreroll: Boolean,
+        currentSrc: String
+    ): List<Format> {
+        val groups = ArrayList<Pair<MediaItem, List<Format>>>()
+        for (item in items) {
+            try {
+                val formats = Formats.resolve(item, headers)
+                if (formats.isNotEmpty()) groups.add(item to formats)
+            } catch (_: Exception) {
             }
+        }
+        if (groups.isEmpty()) return emptyList()
+
+        fun duration(group: List<Format>): Double =
+            group.map { it.durSec }.filter { it.isFinite() && it > 0.0 }.maxOrNull() ?: 0.0
+
+        val longest = groups.maxOfOrNull { duration(it.second) } ?: 0.0
+        val hasLongAlternative = groups.any { (_, formats) ->
+            val d = duration(formats)
+            d > 20.0 && (expectedDuration !in 1.0..12.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0))
+        }
+
+        val usable = groups.filter { (item, formats) ->
+            val d = duration(formats)
+            val pendingAdRequest = item.origin == "network-pending-ad"
+
+            when {
+                // Requests captured during the ad window are only promoted when the response
+                // itself proves it is a long HLS media list. Direct files have no reliable
+                // duration metadata here, so they are not guessed to be the movie.
+                pendingAdRequest -> d > 20.0 && when {
+                    expectedDuration > 20.0 -> abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
+                    expectedDuration in 1.0..12.0 -> d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                    else -> true
+                }
+                // While an ad/preroll is active, never offer the current source. A different
+                // source predeclared by this player's DOM/config may be the movie's direct
+                // MP4 quality and often has no duration until playback; allow it after URL
+                // ad/preview filtering. HLS alternatives still require a credible long duration.
+                isAdOrPreroll -> item.origin == "dom" && item.url != currentSrc && (
+                    (item.type == "direct" && d <= 0.0) ||
+                    (d > 20.0 && (expectedDuration <= 20.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)))
+                )
+                expectedDuration > 20.0 -> d <= 0.0 || abs(d - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
+                expectedDuration in 1.0..12.0 && hasLongAlternative -> d <= 0.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
+                expectedDuration <= 0.0 && longest > 20.0 -> d <= 0.0 || d >= maxOf(20.0, longest * 0.35)
+                else -> true
+            }
+        }
+
+        if (usable.isEmpty()) return emptyList()
+        val masterGroup = usable
+            .filter { (_, formats) -> formats.any { it.fromMaster && !it.isAudio } }
+            .maxByOrNull { (_, formats) -> formats.count { it.fromMaster && !it.isAudio } }
+        val chosen = if (masterGroup != null) listOf(masterGroup) else usable
+        return chosen.flatMap { it.second }
+            .filter { format ->
+                !format.isAudio && !Formats.isAudio(format.ext) && !isExcludedMediaUrl(format.url) &&
+                    (format.kind == "hls" || Util.kindOf("x." + format.ext) == "video")
+            }
+            .distinctBy { it.url }
+            .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
+    }
+
+    private fun scheduleBackgroundResolve(t: Tab) {
+        val key = resolutionKey(t)
+        if (t.primaryVideoId.isNullOrBlank() || t.media.isEmpty()) {
+            t.resolvedFormats = null
+            t.resolvedKey = ""
+            t.resolvingKey = ""
+            return
+        }
+        if (key == t.resolvedKey || key == t.resolvingKey) return
+
+        val videoId = t.primaryVideoId
+        val epoch = t.primarySourceEpoch
+        val expectedDuration = t.expectedDurationSec
+        val currentSrc = t.primaryCurrentSrc
+        val blockedAsAd = t.primaryIsAd || t.suspectedPreroll
+        val items = t.media.values
+            .sortedWith(compareBy<MediaItem> { if (it.origin == "dom") 0 else 1 }.thenBy { if (it.type == "hls") 0 else 1 })
+            .take(24)
+        val headers = headersFor(t)
+        t.resolvingKey = key
+        io.execute {
+            val resolved = resolveQualityGroups(items, headers, expectedDuration, blockedAsAd, currentSrc)
+            ui.post {
+                if (tabs.any { it === t } && t.primaryVideoId == videoId &&
+                    t.primarySourceEpoch == epoch && resolutionKey(t) == key) {
+                    t.resolvedFormats = resolved
+                    t.resolvedKey = key
+                }
+                if (t.resolvingKey == key) t.resolvingKey = ""
+                if (cur === t) updateFab()
+            }
+        }
     }
 
     private fun addPreparedSource(t: Tab, url: String, videoId: String) {
@@ -1057,29 +1224,21 @@ class MainActivity : AppCompatActivity() {
         t.pageRequests.forEach { (url, time) ->
             if (now - time <= 90_000L && isCandidateMediaRequest(url)) {
                 if (isAd) t.pendingSniffed[url] = time
-                else t.sniffed[url] = SniffedMedia(url, time, id, epoch)
+                else t.sniffed[url] = SniffedMedia(url, time, id, epoch, false)
             }
         }
         t.pageRequests.clear()
-    }
-
-    private fun advanceSniffedEpochForContent(t: Tab, id: String, epoch: Int) {
-        val now = System.currentTimeMillis()
-        val recent = t.sniffed.values.filter {
-            it.videoId == id && now - it.requestedAt in 0L..120_000L
-        }
-        t.sniffed.entries.removeAll { it.value.videoId == id }
-        recent.forEach { old ->
-            t.sniffed[old.url] = SniffedMedia(old.url, old.requestedAt, id, epoch)
-        }
     }
 
     private fun promotePendingSniffed(t: Tab, id: String, epoch: Int) {
         val now = System.currentTimeMillis()
         t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
         t.pendingSniffed.forEach { (url, time) ->
-            if (now - time <= 120_000L && isCandidateMediaRequest(url)) {
-                t.sniffed[url] = SniffedMedia(url, time, id, epoch)
+            // A complete HLS playlist can be checked against the post-ad content duration.
+            // A direct MP4 captured during the ad window has no reliable duration here and
+            // is deliberately not promoted, to avoid offering the ad as the movie.
+            if (now - time <= 120_000L && isHlsUrl(url) && isCandidateMediaRequest(url)) {
+                t.sniffed[url] = SniffedMedia(url, time, id, epoch, true)
             }
         }
         t.pendingSniffed.clear()
@@ -1101,20 +1260,24 @@ class MainActivity : AppCompatActivity() {
             val generationChanged = (t.primarySourceKey.isNotEmpty() && t.primarySourceKey != sourceKey) ||
                 t.primarySourceEpoch != sourceEpoch || t.primaryCycle != cycle
             val wasAd = t.primaryIsAd
+            val wasPreroll = t.suspectedPreroll
             val nowAd = isAd || adContainer
             if (generationChanged) {
-                if (wasAd && !nowAd) advanceSniffedEpochForContent(t, id, sourceEpoch)
-                else t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
-                if (!wasAd && !nowAd) {
+                t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
+                if (!wasAd && !nowAd && !wasPreroll) {
                     t.preparedMedia.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
                 }
             }
             t.primarySourceKey = sourceKey
+            // sourceKey is src + delimiter + discovered URLs; use source from latest scan when available.
             t.primarySourceEpoch = sourceEpoch
             t.primaryCycle = cycle
             t.primaryIsAd = nowAd
-            // لا تسجل مدة الإعلان على أنها مدة المحتوى. تُحدّث المدة فقط بعد زوال علامات الإعلان.
-            if (!nowAd && duration.isFinite() && duration > 0.0) t.expectedDurationSec = duration
+            if (event == "content-transition") t.suspectedPreroll = false
+            // لا تسجل مدة قصيرة جدًا للإعلان/المعاينة باعتبارها مدة المحتوى.
+            if (!nowAd && !t.suspectedPreroll && duration.isFinite() && duration > 12.0) {
+                t.expectedDurationSec = duration
+            }
             // احتفظ بمصادر المحتوى المسبقة التي عثرنا عليها في إعدادات المشغل أثناء الإعلان.
             // أضف المصادر الجديدة التي استخرجها DOM؛ addPreparedSource يستبعد روابط الإعلان الصريحة.
             if (sourcesJson.isNotBlank()) {
@@ -1124,8 +1287,8 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Exception) {
                 }
             }
-            if (wasAd && !nowAd) promotePendingSniffed(t, id, sourceEpoch)
-            if (t.primaryIsAd || event == "pause" || event == "ended" || event == "emptied") {
+            if ((wasAd || wasPreroll) && !nowAd && !t.suspectedPreroll) promotePendingSniffed(t, id, sourceEpoch)
+            if (t.primaryIsAd || t.suspectedPreroll || event == "pause" || event == "ended" || event == "emptied") {
                 t.activePlayback = false
                 t.activeId = null
             }
@@ -1151,8 +1314,8 @@ class MainActivity : AppCompatActivity() {
         }
         // تُجهّز مصادر مشغل الفيديو الرئيسي منذ تحميل صفحة المشاهدة، حتى قبل ضغط Play.
         // لا يغيّر ذلك لون الزر؛ فالتفعيل الأحمر ما زال يتطلب تشغيلًا فعليًا بدأه المستخدم.
-        if (t.primaryIsAd) {
-            // لا نعرض مصادر فترة الإعلان، لكن نحتفظ مؤقتًا بالطلبات المرشحة غير المعلّمة
+        if (t.primaryIsAd || t.suspectedPreroll) {
+            // لا نعرض مصادر فترة الإعلان/المصدر القصير غير المصنف، لكن نحتفظ مؤقتًا بالطلبات المرشحة
             // لنربط طلبات المحتوى التي بدأ تحميلها قبل انتقال المشغل من الإعلان إلى الفيلم.
             t.pendingSniffed[url] = now
             t.pendingSniffed.entries.removeAll { now - it.value !in 0L..120_000L }
@@ -1203,7 +1366,10 @@ class MainActivity : AppCompatActivity() {
         val sourceChanged = t.primaryVideoId != id || t.primarySourceKey != key ||
             t.primarySourceEpoch != epoch || t.primaryCycle != cycle
         val wasAd = t.primaryIsAd
+        val wasPreroll = t.suspectedPreroll
         val nowAd = isAd || adContainer
+        val sourcesForContent = p.optJSONArray("sources")
+        val suspectedPreroll = p.optBoolean("suspectedPreroll", false) && !nowAd
 
         val primaryChanged = t.primaryVideoId != id
         if (primaryChanged) {
@@ -1213,9 +1379,8 @@ class MainActivity : AppCompatActivity() {
             t.pendingSniffed.clear()
             t.userGestureVideoIds.removeAll { it != id }
         } else if (sourceChanged) {
-            if (wasAd && !nowAd) advanceSniffedEpochForContent(t, id, epoch)
-            else t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != epoch }
-            if (!wasAd && !nowAd) {
+            t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != epoch }
+            if (!wasAd && !nowAd && !wasPreroll && !suspectedPreroll) {
                 t.preparedMedia.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != epoch }
             }
         }
@@ -1225,25 +1390,30 @@ class MainActivity : AppCompatActivity() {
         t.primarySourceEpoch = epoch
         t.primaryCycle = cycle
         t.primaryIsAd = nowAd
-        if (primaryChanged) promotePageRequests(t, id, epoch, nowAd)
+        t.suspectedPreroll = suspectedPreroll
+        if (primaryChanged) promotePageRequests(t, id, epoch, nowAd || suspectedPreroll)
         val src = p.optString("src")
+        t.primaryCurrentSrc = src
         t.sawBlob = p.optBoolean("blob", src.startsWith("blob:", true))
         t.poster = p.optString("poster")
         val duration = p.optDouble("duration", 0.0)
-        // مدة عنصر الفيديو أثناء preroll تخص الإعلان؛ لا تستبدل بها مدة الفيلم الرئيسي.
-        if (!nowAd && duration.isFinite() && duration > 0.0) t.expectedDurationSec = duration
-        if (wasAd && !nowAd) promotePendingSniffed(t, id, epoch)
+        // مدة عنصر الفيديو القصيرة وغير المصنفة قد تكون مدة إعلان؛ لا نعتمدها كمدة الفيلم.
+        if (!nowAd && !suspectedPreroll && duration.isFinite() && duration > 12.0) {
+            t.expectedDurationSec = duration
+        }
+        if ((wasAd || wasPreroll) && !nowAd && !suspectedPreroll) promotePendingSniffed(t, id, epoch)
 
         // تجهّز المصادر من DOM وإعدادات المشغل قبل بدء التشغيل، وتبقى محفوظة أثناء الإعلان.
         // JavaScript يستبعد currentSrc عند ظهور علامات الإعلان، بينما يستخرج مصادر المحتوى من config.
-        val arr = p.optJSONArray("sources")
+        val arr = sourcesForContent
         if (arr != null) {
             for (i in 0 until arr.length()) addPreparedSource(t, arr.optString(i), id)
         }
 
         val a = o.optJSONObject("a")
         val gestureMatches = id in t.userGestureVideoIds
-        t.activePlayback = a != null && a.optString("id") == id && gestureMatches && !t.primaryIsAd
+        t.activePlayback = a != null && a.optString("id") == id && gestureMatches &&
+            !t.primaryIsAd && !t.suspectedPreroll
         t.activeId = if (t.activePlayback) id else null
         syncMedia(t)
         if (cur === t) updateFab()
@@ -1268,83 +1438,34 @@ class MainActivity : AppCompatActivity() {
         val videoId = t.primaryVideoId
         if (videoId == null || t.media.isEmpty()) {
             val message = when {
-                t.primaryIsAd -> "المشغل يعرض إعلانًا حاليًا؛ يتم تجهيز روابط المحتوى الرئيسي بعد انتقال المشغل إليه"
-                t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE؛ انتظر تحميل مصدر المحتوى أو ابدأ تشغيله بعد الإعلان"
+                t.primaryIsAd -> "المشغل يعرض إعلانًا؛ لن نعرض روابطه. انتظر انتقاله إلى المحتوى الرئيسي"
+                t.suspectedPreroll -> "المصدر الحالي قصير وغير معروف وقد يكون إعلانًا؛ انتظر بدء الفيديو الرئيسي"
+                t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE؛ انتظر كشف قائمة المحتوى أو بدء تشغيله"
                 else -> "لم تُكتشف مصادر الفيديو الرئيسي بعد؛ انتظر اكتمال تهيئة المشغل"
             }
             toast(message)
             return
         }
-        val expectedDuration = t.expectedDurationSec
-        val sourceEpoch = t.primarySourceEpoch
-        toast(if (t.activePlayback) "جارٍ جلب جودات الفيديو الجاري تشغيله..." else "جارٍ جلب الجودات المحضّرة للفيديو الرئيسي...")
-        val items = t.media.values.toList()
+
+        val key = resolutionKey(t)
         val headers = headersFor(t)
         val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
-        io.execute {
-            val resolvedGroups = ArrayList<Pair<MediaItem, List<Format>>>()
-            for (item in items) {
-                try {
-                    val formats = Formats.resolve(item, headers)
-                    if (formats.isNotEmpty()) resolvedGroups.add(item to formats)
-                } catch (_: Exception) {
-                }
-            }
-
-            // إذا أصبحت مدة المحتوى معروفة، استبعد مجموعة مصدر قصيرة/قديمة لا تطابق مدة الفيديو.
-            // لا نستخدم هذا الشرط قبل معرفة مدة المحتوى؛ فقد يكون إعلان ما قبل التشغيل هو الذي يعرض مدته مؤقتًا.
-            val durationFiltered = resolvedGroups.filter { (_, group) ->
-                val candidateDuration = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
-                when {
-                    candidateDuration <= 0.0 -> true
-                    expectedDuration > 20.0 -> abs(candidateDuration - expectedDuration) <= maxOf(18.0, expectedDuration * 0.12)
-                    expectedDuration in 1.0..12.0 -> candidateDuration >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
-                    else -> true
-                }
-            }
-            val hasLongContentAlternative = expectedDuration in 1.0..12.0 &&
-                resolvedGroups.any { (_, group) ->
-                    val candidateDuration = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
-                    candidateDuration >= expectedDuration + maxOf(20.0, expectedDuration * 2.0)
-                }
-            val longestKnownDuration = resolvedGroups.maxOfOrNull { (_, group) ->
-                group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
-            } ?: 0.0
-            val contentLengthFiltered = if (expectedDuration <= 0.0 && longestKnownDuration > 20.0) {
-                resolvedGroups.filter { (_, group) ->
-                    val d = group.map { it.durSec }.filter { it > 0.0 }.maxOrNull() ?: 0.0
-                    d <= 0.0 || d >= maxOf(20.0, longestKnownDuration * 0.35)
-                }
-            } else resolvedGroups
-            val usableGroups = when {
-                expectedDuration > 20.0 -> durationFiltered
-                hasLongContentAlternative -> durationFiltered
-                expectedDuration <= 0.0 && longestKnownDuration > 20.0 -> contentLengthFiltered
-                else -> resolvedGroups
-            }
-            val masterGroup = usableGroups
-                .filter { (_, group) -> group.any { it.fromMaster && !it.isAudio } }
-                .maxByOrNull { (_, group) -> group.count { it.fromMaster && !it.isAudio } }
-            val chosenGroups = if (masterGroup != null) listOf(masterGroup) else usableGroups
-            val clean = chosenGroups.flatMap { it.second }
-                .filter { f ->
-                    !f.isAudio && !Formats.isAudio(f.ext) && !isExcludedMediaUrl(f.url) &&
-                        (f.kind == "hls" || Util.kindOf("x." + f.ext) == "video")
-                }
-                .distinctBy { f -> f.url }
-                .sortedWith(compareByDescending<Format> { qualityRank(it.label) }.thenByDescending { it.bytes })
-            ui.post {
-                if (isFinishing || isDestroyed) return@post
-                // لا نعرض نتائج إعلان/فيديو/فترة مصدر سابقة بعد انتقال المشغل إلى محتوى آخر.
-                if (cur !== t || t.primaryVideoId != videoId || t.primarySourceEpoch != sourceEpoch) return@post
-                if (clean.isEmpty()) {
-                    toast("لم أتمكن من استخراج جودات الفيديو الرئيسي؛ قد يكون المصدر محميًا أو غير مكشوف للصفحة")
-                } else {
-                    showFormatSheet(clean, headers, title, poster)
-                }
-            }
+        val cached = t.resolvedFormats
+        if (t.resolvedKey == key && !cached.isNullOrEmpty()) {
+            showFormatSheet(cached, headers, title, poster)
+            return
         }
+        if (t.resolvingKey == key) {
+            toast("جارٍ تجهيز جودات الفيديو في الخلفية؛ اضغط مرة أخرى بعد اكتمال التحضير")
+            return
+        }
+        if (t.resolvedKey == key && cached.isNullOrEmpty()) {
+            toast("لم أتمكن من استخراج جودات الفيديو الرئيسي؛ قد يكون المصدر غير مكشوف أو محميًا")
+            return
+        }
+        scheduleBackgroundResolve(t)
+        toast("بدأ تجهيز جودات الفيديو؛ اضغط مرة أخرى بعد اكتمال التحضير")
     }
 
     private fun qualityRank(label: String): Int {

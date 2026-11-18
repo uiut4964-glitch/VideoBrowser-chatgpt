@@ -417,7 +417,7 @@ object Engine {
 
         // Resume only when the exact playlist content is unchanged. A matching segment
         // count alone is not enough: URLs, byte ranges, keys and sequence numbers may differ.
-        val fingerprint = sha256((t.url + "\n" + playlistText).toByteArray(Charsets.UTF_8))
+        val fingerprint = sha256(structureOf(media).toByteArray(Charsets.UTF_8))
         val marker = File(dir, "hls-manifest.sha256")
         val oldFingerprint = marker.takeIf { it.exists() }?.readText()?.trim()
         val hasOldSegments = dir.listFiles()?.any { it.name.matches(Regex("s\\d+")) || it.name == "init" } == true
@@ -539,6 +539,77 @@ object Engine {
         }
     }
 
+    /**
+     * Stable HLS resume fingerprint: retain resource identity and timeline structure,
+     * but omit short-lived authentication/signature query parameters so refreshed
+     * CDN tokens do not force a complete multi-gigabyte re-download.
+     */
+    private fun stableResourceIdentity(raw: String): String {
+        val uri = Uri.parse(raw)
+        val volatileQueryKeys = setOf(
+            "token", "access_token", "auth", "authorization", "signature", "sig",
+            "expires", "exp", "policy", "key-pair-id", "hdnea", "hdnts", "jwt",
+            "session", "sessionid", "nonce", "st", "et", "x-amz-signature",
+            "x-amz-credential", "x-amz-date", "x-amz-expires", "x-amz-security-token",
+            "x-goog-signature", "x-goog-credential", "x-goog-date", "x-goog-expires"
+        )
+        val stableQuery = uri.queryParameterNames
+            .filterNot { it.lowercase(Locale.ROOT) in volatileQueryKeys || it.lowercase(Locale.ROOT).startsWith("x-amz-") || it.lowercase(Locale.ROOT).startsWith("x-goog-") }
+            .sorted()
+            .joinToString("&") { key ->
+                val value = uri.getQueryParameter(key).orEmpty()
+                key + "=" + value
+            }
+        return buildString {
+            append(uri.scheme.orEmpty()).append("://")
+            append(uri.encodedAuthority.orEmpty())
+            append(uri.encodedPath.orEmpty())
+            if (stableQuery.isNotEmpty()) append('?').append(stableQuery)
+        }
+    }
+
+    /**
+     * Include segment/init/key resource identity, sequence, duration, byte ranges,
+     * discontinuities and encryption IV. This is safer than segment-count-only matching
+     * and more resilient than hashing the entire signed playlist verbatim.
+     */
+    private fun structureOf(m: Hls.Media): String {
+        val sb = StringBuilder()
+        sb.append("v3|").append(m.segs.size).append('|')
+            .append(m.endList).append('|').append(m.hasDiscontinuity).append('|')
+        val ini = m.init
+        if (ini != null) {
+            sb.append("init:").append(stableResourceIdentity(ini.url)).append(':')
+                .append(ini.rangeStart).append(':').append(ini.rangeLength).append(':')
+                .append(ini.keyUri?.let { stableResourceIdentity(it) }.orEmpty()).append(':')
+                .append(ini.iv.orEmpty()).append('|')
+        }
+        for (segment in m.segs) {
+            sb.append(stableResourceIdentity(segment.url)).append('|')
+                .append(segment.seq).append(':')
+                .append(String.format(Locale.US, "%.3f", segment.dur)).append(':')
+                .append(segment.rangeStart).append(':').append(segment.rangeLength).append(':')
+                .append(if (segment.discontinuityBefore) 1 else 0).append(':')
+                .append(if (segment.gap) 1 else 0).append(':')
+                .append(segment.keyUri?.let { stableResourceIdentity(it) }.orEmpty()).append(':')
+                .append(segment.iv.orEmpty()).append(';')
+        }
+        return sb.toString()
+    }
+
+    /** يتأكد من وجود مساحة كافية للملف الوسيط والملف النهائي قبل بدء الدمج */
+    private fun ensureFreeSpace(dir: File, sources: List<File>) {
+        val bytes = sources.sumOf { it.length() }
+        val need = (bytes.toDouble() * 2.1).toLong() + 128L * 1024L * 1024L
+        val free = dir.usableSpace
+        if (free < need) {
+            throw IOException(
+                "المساحة الحرة غير كافية للدمج: المتاح " + formatBytes(free) + "، والمطلوب تقريبًا " + formatBytes(need) +
+                    ". حرّر مساحة ثم أعد المحاولة؛ لن تُحذف المقاطع التي تم تنزيلها."
+            )
+        }
+    }
+
     private fun sha256(data: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(data).joinToString("") { "%02x".format(it) }
 
@@ -592,6 +663,7 @@ object Engine {
             // Never label a byte-concatenated TS/FMP4 stream as MP4. Use the
             // container-appropriate path, and rebuild timestamp discontinuities as
             // a sequence of independent media items before saving the final file.
+            ensureFreeSpace(dir, files)
             val hasInitMap = init.exists()
             val rebuilt = if (hasInitMap) File(dir, "hls-final.mp4") else File(dir, "hls-final.ts")
             if (rebuilt.exists()) rebuilt.delete()
@@ -926,7 +998,7 @@ object Engine {
         var referenceSignatures: List<String>? = null
         var timelineUs = 0L
         val bufferInfo = MediaCodec.BufferInfo()
-        val emptyBuffer = ByteBuffer.allocateDirect(0)
+        var sharedBuffer: ByteBuffer? = null
 
         try {
             for (segmentIndex in 0 until segmentCount) {
@@ -1016,7 +1088,8 @@ object Engine {
                         }.maxOrNull() ?: 0
                         val capacity = (maxInputSize.toLong() + 64L * 1024L)
                             .coerceIn(4L * 1024L * 1024L, 32L * 1024L * 1024L).toInt()
-                        val buffer = ByteBuffer.allocateDirect(capacity)
+                        val buffer: ByteBuffer = if (sharedBuffer != null && sharedBuffer!!.capacity() >= capacity) sharedBuffer!!
+                        else ByteBuffer.allocateDirect(capacity).also { sharedBuffer = it }
                         while (true) {
                             buffer.clear()
                             val size = extractor.readSampleData(buffer, 0)
@@ -1038,7 +1111,18 @@ object Engine {
                             // track the maximum PTS only for the next segment boundary.
                             buffer.position(0)
                             buffer.limit(size)
-                            bufferInfo.set(0, size, outputPts, extractor.sampleFlags)
+                            val extractorFlags = extractor.sampleFlags
+                            if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0) {
+                                throw IOException("مقطع HLS يحتوي عينة مشفرة لم تُفك قبل إعادة بناء MP4")
+                            }
+                            var muxFlags = 0
+                            if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                muxFlags = muxFlags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+                            }
+                            if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) {
+                                muxFlags = muxFlags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+                            }
+                            bufferInfo.set(0, size, outputPts, muxFlags)
                             muxer!!.writeSampleData(outputTrack, buffer, bufferInfo)
                             maxPtsByOutputTrack[outputTrack] = maxOf(maxPtsByOutputTrack[outputTrack], outputPts)
                             if (!extractor.advance()) break
@@ -1064,12 +1148,6 @@ object Engine {
                 val allowedTail = (maxOf(10.0, lastSegmentDuration + 2.0) * 1_000_000.0).toLong()
                 if (maxPtsByOutputTrack.any { it < 0L || it + allowedTail < endUs }) {
                     throw IOException("بيانات أحد مسارات الصوت/الفيديو تنتهي قبل المدة المعلنة في قائمة HLS؛ رُفض الملف بدل إخفاء النقص بتمديد آخر إطار")
-                }
-                for (track in maxPtsByOutputTrack.indices) {
-                    if (maxPtsByOutputTrack[track] >= 0L && endUs > maxPtsByOutputTrack[track]) {
-                        bufferInfo.set(0, 0, endUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        muxer!!.writeSampleData(track, emptyBuffer, bufferInfo)
-                    }
                 }
             }
             muxer!!.stop()
