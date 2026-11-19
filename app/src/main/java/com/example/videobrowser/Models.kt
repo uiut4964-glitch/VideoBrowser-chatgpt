@@ -40,7 +40,9 @@ class Format(
     val frameRate: Double = 0.0,
     val dynamicRange: String = "",
     val bandwidth: Long = 0L,
-    val representationId: String = ""
+    val representationId: String = "",
+    val ytDlpPageUrl: String = "",
+    val ytDlpFormatId: String = ""
 )
 
 object St {
@@ -74,6 +76,10 @@ class Task(
     @Volatile var hasHlsDiscontinuity = false
     var rangeOk = false
     var thumbUrl = ""
+    // Preserve the yt-dlp page/format choice so the download uses the same curl_cffi transport.
+    var ytDlpPageUrl = ""
+    var ytDlpFormatId = ""
+    @Volatile var ytDlpDownloadedOutput = false
     @Volatile var partDone: LongArray? = null
     var partSize: LongArray? = null
     @Volatile var segState: BooleanArray? = null
@@ -86,7 +92,7 @@ class Task(
     val lock = Any()
 
     fun permille(): Int =
-        if (kind == "hls") {
+        if (kind == "hls" && ytDlpPageUrl.isBlank() && !ytDlpDownloadedOutput) {
             if (segCount > 0) (segDone.get() * 1000L / segCount).toInt() else 0
         } else {
             if (total > 0) (downloaded.get() * 1000L / total).toInt() else 0

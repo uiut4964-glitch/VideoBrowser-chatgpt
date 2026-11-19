@@ -51,5 +51,27 @@ fun main() {
     check(!CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext, "https://other.example", topPageUrl = "https://other.example/watch/42", nowMillis = 2_000L))
     check(!CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 200_000L))
 
-    println("Capture headers test passed: allowlist, secret exclusion, request merge, and safe opaque-source context binding")
+    // A player may expose many quality URLs but WebView may request only the active
+    // rendition. Safe browser headers can be shared with sibling URLs on the same CDN host.
+    val siblingUrl = "https://cdn.example/cdn/path/720.mp4?token=other"
+    check(CaptureHeaders.matchesPreparedSourceHost(
+        siblingUrl, playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L
+    ))
+    check(!CaptureHeaders.matchesPreparedSourceHost(
+        "https://other-cdn.example/cdn/path/720.mp4", playerContext, "https://site.example",
+        topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L
+    ))
+    check(!CaptureHeaders.matchesPreparedSourceHost(
+        siblingUrl, playerContext.copy(pageUrl = "https://unrelated.example/watch/42"), "https://site.example",
+        topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L
+    ))
+    check(!CaptureHeaders.matchesPreparedSourceHost(
+        siblingUrl, playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 200_000L
+    ))
+    check(!CaptureHeaders.matchesPreparedSourceHost(
+        siblingUrl, playerContext.copy(headers = mapOf("Cookie" to "private=1", "Authorization" to "secret")),
+        "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L
+    ))
+
+    println("Capture headers test passed: allowlist, secret exclusion, exact and same-CDN sibling context binding")
 }

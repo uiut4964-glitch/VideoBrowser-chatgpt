@@ -19,6 +19,8 @@ node test_preroll_gate.js
 node test_stage35_invariants.js
 node test_xhamster_sources.js
 node test_ytdlp_integration.js
+node test_pornhub_request_context.js
+node test_ytdlp_curl_runtime.js
 ```
 
 وتتحقق من:
@@ -84,9 +86,9 @@ java --add-modules jdk.httpserver -jar /tmp/vb-net-probe-test.jar
 يُفحص ملف JavaScript المحقون عند بداية المستند منفصلًا بواسطة: `kotlinc app/src/main/java/com/example/videobrowser/ApiCaptureScript.kt -d /tmp/vb-early-api-capture.jar`.
 
 
-## اختبار دمج yt-dlp (الإصدار 1.11.7)
+## اختبار دمج yt-dlp وPornhub (الإصدار 1.12.0)
 
-يشغّل `node test_ytdlp_integration.js` للتحقق من اعتماد Maven الرسمي `youtubedl-android:0.18.1`، واستدعاء `YoutubeDL.getInfo()` الفعلي، وبدء تحليل الصفحة قبل التشغيل، وتمرير Cookies عند الطلب دون حفظها داخل ملف مهام التنزيل، وربط الصيغ بزر القائمة، وحماية عدم عرض DASH غير المدعوم بعد.
+تشغّل `node test_ytdlp_integration.js` و`node test_pornhub_request_context.js` و`node test_ytdlp_curl_runtime.js` للتحقق من Runtime Python 3.14.8 مع curl_cffi 0.17.0، ومحاكاة Chrome لصفحات Pornhub، وتطابق User-Agent مع TLS impersonation، وتمرير Cookies عبر ملف مؤقت، وربط الصيغ المختارة بمسار تنزيل yt-dlp نفسه. كما تتحقق من عدم إسقاط format IDs مختلفة عند اشتراكها في URL/manifest واحد.
 
 ## اختبارات Stage 3.6
 

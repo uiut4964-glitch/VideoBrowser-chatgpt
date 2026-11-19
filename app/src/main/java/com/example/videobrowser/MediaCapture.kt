@@ -94,6 +94,47 @@ object CaptureHeaders {
         } catch (_: Exception) { null }
     }
 
+    /**
+     * Some players publish several signed rendition URLs on one CDN host but only
+     * actually request the currently selected rendition. In that case WebView has a
+     * real request context for one sibling URL, not for every URL in mediaDefinitions.
+     * Share only the safe allowlisted headers with sibling renditions on the exact same
+     * CDN host and only when the request came from the same player page origin.
+     * Cookies and Authorization are never part of this map; CookieManager resolves
+     * cookies independently for each target URL at request time.
+     */
+    fun matchesPreparedSourceHost(
+        preparedUrl: String,
+        request: CapturedMediaRequest,
+        primaryFrameOrigin: String,
+        topPageUrl: String = "",
+        nowMillis: Long = System.currentTimeMillis(),
+        maxAgeMillis: Long = 180_000L
+    ): Boolean {
+        if (!request.method.equals("GET", true)) return false
+        if (nowMillis - request.capturedAt !in 0L..maxAgeMillis) return false
+        val preparedHost = webHost(preparedUrl) ?: return false
+        val requestHost = webHost(request.url) ?: return false
+        if (preparedHost != requestHost) return false
+        val expectedOrigin = webOrigin(primaryFrameOrigin)
+        val topOrigin = webOrigin(topPageUrl)
+        val requestOrigin = webOrigin(request.pageUrl)
+        if (requestOrigin != null && expectedOrigin != null && requestOrigin != expectedOrigin && requestOrigin != topOrigin) return false
+        // Do not let a request with no usable safe headers count as a match.
+        return safeRequestHeaders(request.headers).isNotEmpty()
+    }
+
+    private fun webHost(raw: String): String? {
+        return try {
+            val uri = java.net.URI(raw.trim())
+            val scheme = uri.scheme?.lowercase() ?: return null
+            val host = uri.host?.lowercase() ?: return null
+            if (scheme != "http" && scheme != "https") return null
+            val port = if (uri.port == -1 || (scheme == "https" && uri.port == 443) || (scheme == "http" && uri.port == 80)) "" else ":${uri.port}"
+            host + port
+        } catch (_: Exception) { null }
+    }
+
     /** Request-specific values override the page-level fallback values. */
     fun merge(base: Map<String, String>, request: Map<String, String>): Map<String, String> {
         val result = LinkedHashMap<String, String>()

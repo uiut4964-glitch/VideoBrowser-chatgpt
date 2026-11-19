@@ -2385,15 +2385,21 @@ class MainActivity : AppCompatActivity() {
         val id = t.primaryVideoId
         val now = System.currentTimeMillis()
         t.preparedMedia.forEach { (url, item) ->
-            val context = t.requestContexts[url]
-            val freshContext = context?.takeIf {
+            val exactContext = t.requestContexts[url]?.takeIf {
                 CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin, t.url, now)
             }
-            val headers = if (freshContext != null) CaptureHeaders.merge(item.requestHeaders, freshContext.headers) else item.requestHeaders
+            // If only the active quality was requested by WebView, apply its safe
+            // request headers to sibling renditions on the same CDN host. This avoids
+            // probing alternate qualities with a weaker, page-only header set.
+            val hostContext = exactContext ?: t.requestContexts.values.asSequence()
+                .filter { CaptureHeaders.matchesPreparedSourceHost(url, it, t.primaryFrameOrigin, t.url, now) }
+                .maxByOrNull { it.capturedAt }
+            val safeContextHeaders = hostContext?.let { CaptureHeaders.safeRequestHeaders(it.headers) }.orEmpty()
+            val headers = if (safeContextHeaders.isNotEmpty()) CaptureHeaders.merge(item.requestHeaders, safeContextHeaders) else item.requestHeaders
             t.media[url] = if (headers == item.requestHeaders) item else MediaItem(
                 item.url, item.type, item.origin, item.videoId, item.sourceEpoch, item.qualityHint,
                 item.widthHint, item.heightHint, item.mimeHint, headers,
-                item.captureSource.ifBlank { freshContext?.source.orEmpty() }, item.codecHint,
+                item.captureSource.ifBlank { hostContext?.source.orEmpty() }, item.codecHint,
                 item.frameRateHint, item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint
             )
         }
@@ -3110,11 +3116,18 @@ class MainActivity : AppCompatActivity() {
         val m = LinkedHashMap<String, String>()
         m["User-Agent"] = w.settings.userAgentString
         if (t.url.startsWith("http")) {
-            m["Referer"] = t.url
             try {
                 val u = URL(t.url)
-                m["Origin"] = u.protocol + "://" + u.host
+                val pageOrigin = u.protocol + "://" + u.host
+                val host = u.host.lowercase(java.util.Locale.ROOT)
+                // yt-dlp's merged Pornhub fix uses the site's root Referer/Origin for
+                // player and manifest requests. A watch-page Referer can trigger a
+                // different CDN response than the real browser's player request.
+                val referer = if (host == "pornhub.com" || host.endsWith(".pornhub.com")) "$pageOrigin/" else t.url
+                m["Referer"] = referer
+                m["Origin"] = pageOrigin
             } catch (_: Exception) {
+                m["Referer"] = t.url
             }
         }
         return CaptureHeaders.safeRequestHeaders(m)
@@ -3136,7 +3149,11 @@ class MainActivity : AppCompatActivity() {
             append("طلبات تنتظر ربطها بالفيديو: ").append(t.pageRequests.size).append("\n")
             append("سياقات طلبات محفوظة: ").append(t.requestContexts.size).append("\n")
             append("سياقات مرتبطة بروابط المشغل: ").append(t.preparedMedia.count { (url, _) ->
-                t.requestContexts[url]?.let { CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin) } == true
+                t.requestContexts[url]?.let { CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin, t.url) } == true
+            }).append("\n")
+            append("جودات ورثت ترويسات WebView من CDN نفسه: ").append(t.preparedMedia.count { (url, _) ->
+                t.requestContexts[url]?.let { CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin, t.url) } == true ||
+                    t.requestContexts.values.any { ctx -> CaptureHeaders.matchesPreparedSourceHost(url, ctx, t.primaryFrameOrigin, t.url) }
             }).append("\n")
             append("رسائل API من الإطارات: ").append(t.frameApiPayloads.size).append("\n")
             append("نبضات تشغيل السكربت: ").append(t.frameProbeStates.size)
@@ -3212,21 +3229,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun mergeFormatLists(primary: List<Format>, secondary: List<Format>): List<Format> {
-        val byUrl = LinkedHashMap<String, Format>()
-        for (format in primary + secondary) {
-            if (format.url.isBlank()) continue
-            val old = byUrl[format.url]
+        val all = (primary + secondary).filter { it.url.isNotBlank() }
+        // Prefer yt-dlp's stable format IDs when present. Different quality IDs can
+        // legitimately share one manifest URL; collapsing only by URL loses qualities.
+        val ytDlpUrls = all.filter { it.ytDlpFormatId.isNotBlank() }.map { it.url }.toSet()
+        val byIdentity = LinkedHashMap<String, Format>()
+        for (format in all) {
+            if (format.ytDlpFormatId.isBlank() && format.url in ytDlpUrls) continue
+            val identity = if (format.ytDlpFormatId.isNotBlank()) {
+                "yt:${format.ytDlpPageUrl}:${format.ytDlpFormatId}"
+            } else {
+                "url:${format.url}"
+            }
+            val old = byIdentity[identity]
             if (old == null) {
-                byUrl[format.url] = format
+                byIdentity[identity] = format
             } else {
                 val oldScore = listOf(old.codec.isNotBlank(), old.frameRate > 0.0, old.bandwidth > 0L,
                     old.bytes > 0L, old.requestHeaders.isNotEmpty()).count { it }
                 val newScore = listOf(format.codec.isNotBlank(), format.frameRate > 0.0, format.bandwidth > 0L,
                     format.bytes > 0L, format.requestHeaders.isNotEmpty()).count { it }
-                if (newScore > oldScore || (newScore == oldScore && format.bytes > old.bytes)) byUrl[format.url] = format
+                if (newScore > oldScore || (newScore == oldScore && format.bytes > old.bytes)) byIdentity[identity] = format
             }
         }
-        return byUrl.values.sortedWith(
+        return byIdentity.values.sortedWith(
             compareByDescending<Format> { qualityRank(it.label) }
                 .thenByDescending { it.frameRate }
                 .thenByDescending { it.bandwidth }
@@ -3680,6 +3706,9 @@ class MainActivity : AppCompatActivity() {
         val t = Task(UUID.randomUUID().toString(), f.url, name, f.kind, headers)
         t.mime = Util.mimeOf(name)
         t.thumbUrl = poster
+        t.ytDlpPageUrl = f.ytDlpPageUrl
+        t.ytDlpFormatId = f.ytDlpFormatId
+        t.ytDlpDownloadedOutput = false
         DownloadCenter.add(t)
         toast("بدأ التحميل — تابعه من زر (التحميلات)")
     }

@@ -98,6 +98,8 @@ object DownloadCenter {
                         .put("total", t.total).put("parts", t.parts).put("status", t.status)
                         .put("error", t.error).put("savedUri", t.savedUri).put("created", t.created)
                         .put("mime", t.mime).put("segCount", t.segCount).put("rangeOk", t.rangeOk).put("thumbUrl", t.thumbUrl)
+                        .put("ytDlpPageUrl", t.ytDlpPageUrl).put("ytDlpFormatId", t.ytDlpFormatId)
+                        .put("ytDlpDownloadedOutput", t.ytDlpDownloadedOutput)
                 )
             }
             file().writeText(a.toString())
@@ -125,6 +127,9 @@ object DownloadCenter {
                 t.segCount = o.optInt("segCount", 0)
                 t.rangeOk = o.optBoolean("rangeOk", false)
                 t.thumbUrl = o.optString("thumbUrl", "")
+                t.ytDlpPageUrl = o.optString("ytDlpPageUrl", "")
+                t.ytDlpFormatId = o.optString("ytDlpFormatId", "")
+                t.ytDlpDownloadedOutput = o.optBoolean("ytDlpDownloadedOutput", false)
                 if (t.status == St.QUEUED || t.status == St.DOWNLOADING || t.status == St.MERGING) t.status = St.PAUSED
                 if (t.status != St.DONE) scanTemp(t)
                 tasks.add(t)
@@ -138,11 +143,18 @@ object DownloadCenter {
         if (!dir.exists()) return
         var c = 0
         var b = 0L
-        val rx = Regex(if (t.kind == "hls") "s\\d+" else "p\\d+")
+        val usesYtDlp = t.ytDlpPageUrl.isNotBlank() && t.ytDlpFormatId.isNotBlank()
+        val rx = Regex(if (t.kind == "hls" && !usesYtDlp) "s\\d+" else "p\\d+")
         dir.listFiles()?.forEach { f -> if (rx.matches(f.name)) { c++; b += f.length() } }
-        if (t.kind == "hls") {
+        if (t.kind == "hls" && !usesYtDlp) {
             t.segDone.set(c)
             if (t.segCount > 0) t.segState = BooleanArray(t.segCount) { File(dir, "s$it").exists() }
+        } else if (usesYtDlp && File(dir, "p0").exists()) {
+            t.parts = 1
+            t.total = File(dir, "p0").length()
+            t.partSize = longArrayOf(t.total)
+            t.partDone = longArrayOf(t.total)
+            t.downloaded.set(t.total)
         } else if (t.parts > 1 && t.total > 0) {
             val n = t.parts
             val chunk = t.total / n
@@ -268,7 +280,8 @@ object DownloadCenter {
             if (Prefs.wifiOnly(ctx) && !Net.onWifi(ctx)) throw IOException("لا يوجد اتصال Wi-Fi (الإعداد: Wi-Fi فقط)")
             t.error = ""
             t.notice = ""
-            if (t.kind == "hls") Engine.hls(t, alive) else Engine.direct(t, alive)
+            if (t.ytDlpPageUrl.isNotBlank() && t.ytDlpFormatId.isNotBlank()) Engine.direct(t, alive)
+            else if (t.kind == "hls") Engine.hls(t, alive) else Engine.direct(t, alive)
             if (!alive()) return
             t.status = St.MERGING
             changed()
@@ -305,6 +318,25 @@ object Engine {
     // ---------- تحميل ملف مباشر بأجزاء متوازية ----------
     fun direct(t: Task, alive: () -> Boolean) {
         val dir = tmpDir(t)
+        if (t.ytDlpPageUrl.isNotBlank() && t.ytDlpFormatId.isNotBlank()) {
+            val output = File(dir, "p0")
+            output.delete()
+            YtDlpExtractor.downloadToFile(
+                ctx, t.ytDlpPageUrl, t.ytDlpFormatId, output, t.headers, alive
+            )
+            if (!alive()) return
+            val bytes = output.length()
+            if (bytes <= 0L) throw IOException("لم ينتج yt-dlp ملفًا صالحًا")
+            t.parts = 1
+            t.total = bytes
+            t.rangeOk = false
+            t.ytDlpDownloadedOutput = true
+            t.partSize = longArrayOf(bytes)
+            t.partDone = longArrayOf(bytes)
+            t.downloaded.set(bytes)
+            t.lastBytes = bytes
+            return
+        }
         val p = Net.probe(t.url, DownloadCenter.requestHeaders(t, t.url))
         val oldTotal = t.total
         val hadParts = dir.listFiles()?.any { it.name.matches(Regex("p\\d+")) } ?: false
@@ -671,7 +703,7 @@ object Engine {
         var name = t.name
         var temporaryHlsOutput: File? = null
 
-        if (t.kind == "hls") {
+        if (t.kind == "hls" && !t.ytDlpDownloadedOutput) {
             val init = File(dir, "init")
             if (init.exists()) files.add(init)
             for (i in 0 until t.segCount) files.add(File(dir, "s$i"))
@@ -728,7 +760,7 @@ object Engine {
         }
 
         for (f in files) if (!f.exists() || f.length() == 0L) throw IOException("ملف مؤقت مفقود أو فارغ")
-        val mime = if (t.kind == "hls") {
+        val mime = if (t.kind == "hls" && !t.ytDlpDownloadedOutput) {
             if (name.substringAfterLast('.', "").equals("ts", true)) "video/mp2t" else "video/mp4"
         } else Util.mimeOf(name)
         val finalBytes = files.sumOf { it.length() }

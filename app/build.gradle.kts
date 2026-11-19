@@ -11,11 +11,10 @@ android {
         applicationId = "com.example.videobrowser"
         minSdk = 29
         targetSdk = 34
-        versionCode = 22
-        versionName = "1.11.8"
+        versionCode = 24
+        versionName = "1.12.0"
 
-        // The current test device is arm64. The yt-dlp Android runtime ships
-        // Python/QuickJS native libraries, so restrict this test APK to ARM64.
+        // ARM64 target test build; the yt-dlp Android runtime ships native libraries.
         ndk { abiFilters.add("arm64-v8a") }
     }
 
@@ -39,7 +38,10 @@ android {
     kotlinOptions { jvmTarget = "17" }
     lint { abortOnError = false }
     packaging {
-        jniLibs { useLegacyPackaging = true }
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += setOf("**/libpython.so", "**/libqjs.so")
+        }
     }
 }
 
@@ -55,6 +57,6 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.11.1")
     implementation("androidx.media3:media3-transformer:1.11.1")
 
-    // Official Android wrapper around the real yt-dlp engine.
-    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    // ZIP runtime extraction with Unix symlink support (Termux CPython runtime).
+    implementation("org.apache.commons:commons-compress:1.27.1")
 }

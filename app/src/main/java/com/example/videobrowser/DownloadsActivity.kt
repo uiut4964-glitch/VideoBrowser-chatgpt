@@ -271,7 +271,7 @@ class DownloadsActivity : AppCompatActivity() {
             St.FAILED -> "فشل: " + t.error
             else -> ""
         }
-        val size = if (t.kind == "hls") {
+        val size = if (t.kind == "hls" && t.ytDlpPageUrl.isBlank()) {
             t.segDone.get().toString() + "/" + t.segCount + " مقطع • " + Util.fmtSize(t.downloaded.get())
         } else {
             Util.fmtSize(t.downloaded.get()) + (if (t.total > 0) " / " + Util.fmtSize(t.total) else "")
@@ -352,7 +352,7 @@ class DownloadsActivity : AppCompatActivity() {
     /** نطاقات التقدم (بداية، نهاية) كنسبة من الملف كاملًا */
     private fun fractions(t: Task): FloatArray {
         val out = ArrayList<Float>()
-        if (t.kind == "hls") {
+        if (t.kind == "hls" && t.ytDlpPageUrl.isBlank()) {
             val st = t.segState
             val n = st?.size ?: 0
             if (st != null && n > 0) {
