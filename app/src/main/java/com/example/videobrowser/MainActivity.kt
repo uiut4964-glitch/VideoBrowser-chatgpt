@@ -883,7 +883,15 @@ class MainActivity : AppCompatActivity() {
         val requestContexts = LinkedHashMap<String, CapturedMediaRequest>()
         // Cross-origin iframe API payloads arrive through WebMessageListener and stay native-side.
         val frameApiPayloads = LinkedHashMap<String, String>()
-        // Cross-origin iframe player snapshots, held only in memory for the active page.
+        // Per-frame startup probes distinguish script injection from missing <video> discovery.
+        val frameProbeStates = LinkedHashMap<String, String>()
+        var frameBridgeRegistered = false
+        var frameBridgeError = ""
+        var frameProbeMessageCount = 0
+        var frameVideoMessageCount = 0
+        var frameReportedLightVideoCount = 0
+        var frameReportedShadowVideoCount = 0
+        // Cross-origin/frame player snapshots, held only in memory for the active page.
         val frameVideoStates = LinkedHashMap<String, String>()
         var primaryFrameOrigin = ""
         var primaryFrameId = ""
@@ -1289,6 +1297,11 @@ class MainActivity : AppCompatActivity() {
         t.documentStartScript = null
         t.requestContexts.clear()
         t.frameApiPayloads.clear()
+        t.frameProbeStates.clear()
+        t.frameProbeMessageCount = 0
+        t.frameVideoMessageCount = 0
+        t.frameReportedLightVideoCount = 0
+        t.frameReportedShadowVideoCount = 0
         t.frameVideoStates.clear()
         t.primaryFrameOrigin = ""
         t.primaryFrameId = ""
@@ -1342,7 +1355,11 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installFrameApiMessageBridge(w: WebView, tab: Tab) {
         try {
-            if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                tab.frameBridgeRegistered = false
+                tab.frameBridgeError = "WEB_MESSAGE_LISTENER غير مدعوم في مزود WebView"
+                return
+            }
             WebViewCompat.addWebMessageListener(
                 w,
                 "VideoBrowserCapture",
@@ -1355,19 +1372,31 @@ class MainActivity : AppCompatActivity() {
                         isMainFrame: Boolean,
                         replyProxy: JavaScriptReplyProxy
                     ) {
-                        if (view !== tab.web || isMainFrame || message.type != WebMessageCompat.TYPE_STRING) return
+                        if (view !== tab.web || message.type != WebMessageCompat.TYPE_STRING) return
                         val raw = message.data ?: return
                         val actualOrigin = sourceOrigin.toString()
                         val messageKind = if (raw.length <= 160_000) {
                             try { JSONObject(raw).optString("kind") } catch (_: Exception) { "" }
                         } else ""
-                        if (messageKind == "frame-video-state") captureFrameVideoState(tab, raw, actualOrigin)
-                        else captureFrameApiPayload(tab, raw, actualOrigin)
+                        when (messageKind) {
+                            // Frame probes are accepted from the top document and child frames.
+                            "frame-probe" -> captureFrameProbe(tab, raw, actualOrigin, isMainFrame)
+                            // The top document can also use this as a fallback for players
+                            // inside open Shadow DOM that SCAN_JS cannot traverse directly.
+                            "frame-video-state" -> captureFrameVideoState(tab, raw, actualOrigin)
+                            // API bodies are bridged only from child frames; the main frame
+                            // keeps its own queue and is consumed by SCAN_JS.
+                            else -> if (!isMainFrame) captureFrameApiPayload(tab, raw, actualOrigin)
+                        }
                     }
                 }
             )
-        } catch (_: Exception) {
-            // Cross-origin iframe capture is optional; top-frame capture still works without this feature.
+            tab.frameBridgeRegistered = true
+            tab.frameBridgeError = ""
+        } catch (e: Exception) {
+            tab.frameBridgeRegistered = false
+            val safeMessage = (e.message ?: "registration failed").replace(Regex("https?://\\S+"), "[origin]").take(120)
+            tab.frameBridgeError = e.javaClass.simpleName + ": " + safeMessage
         }
     }
 
@@ -1389,8 +1418,56 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Receive bounded player state from a cross-origin iframe. The browser page cannot
-     * forge sourceOrigin: it is supplied by AndroidX WebMessageListener itself.
+     * Record a tiny startup/heartbeat from every injected frame, even when it contains
+     * no video element. This makes an empty frame state diagnosable instead of ambiguous.
+     */
+    private fun captureFrameProbe(t: Tab, raw: String, sourceOrigin: String, isMainFrame: Boolean) {
+        if (tabs.none { it === t } || raw.length !in 20..4096) return
+        try {
+            val incoming = JSONObject(raw)
+            if (incoming.optString("kind") != "frame-probe") return
+            val claimedOrigin = incoming.optString("frameOrigin")
+            val originIsWeb = sourceOrigin.startsWith("http://", true) || sourceOrigin.startsWith("https://", true)
+            if (originIsWeb && !sameWebOrigin(claimedOrigin, sourceOrigin)) return
+            // Opaque-origin frames are counted only as probes; their content is never used.
+            val frameId = incoming.optString("frameId").take(100)
+            if (frameId.isBlank()) return
+            val now = System.currentTimeMillis()
+            val storedOrigin = if (originIsWeb) sourceOrigin else "opaque-origin"
+            val key = "$storedOrigin|$frameId"
+            val probe = JSONObject()
+                .put("origin", storedOrigin)
+                .put("frameId", frameId)
+                .put("phase", incoming.optString("phase").take(40))
+                .put("protocol", incoming.optString("protocol").take(20))
+                .put("isTop", isMainFrame)
+                .put("readyState", incoming.optString("readyState").take(20))
+                .put("bridgeReady", incoming.optBoolean("bridgeReady", false))
+                .put("lightVideoCount", incoming.optInt("lightVideoCount", 0).coerceIn(0, 12))
+                .put("shadowVideoCount", incoming.optInt("shadowVideoCount", 0).coerceIn(0, 12))
+                .put("shadowRootCount", incoming.optInt("shadowRootCount", 0).coerceIn(0, 24))
+                .put("at", now)
+            t.frameProbeMessageCount++
+            t.frameReportedLightVideoCount = maxOf(t.frameReportedLightVideoCount, probe.optInt("lightVideoCount"))
+            t.frameReportedShadowVideoCount = maxOf(t.frameReportedShadowVideoCount, probe.optInt("shadowVideoCount"))
+            t.frameProbeStates.remove(key)
+            t.frameProbeStates[key] = probe.toString()
+            t.frameProbeStates.entries.removeAll { entry ->
+                try { now - JSONObject(entry.value).optLong("at", 0L) !in 0L..30_000L }
+                catch (_: Exception) { true }
+            }
+            while (t.frameProbeStates.size > 32) {
+                val oldest = t.frameProbeStates.keys.firstOrNull() ?: break
+                t.frameProbeStates.remove(oldest)
+            }
+        } catch (_: Exception) {
+            // Invalid diagnostic messages are ignored.
+        }
+    }
+
+    /**
+     * Receive bounded player state from a frame. The browser page cannot forge sourceOrigin:
+     * it is supplied by AndroidX WebMessageListener itself.
      */
     private fun captureFrameVideoState(t: Tab, raw: String, sourceOrigin: String) {
         if (tabs.none { it === t } || raw.length !in 20..160_000 || !sourceOrigin.startsWith("http")) return
@@ -1456,7 +1533,11 @@ class MainActivity : AppCompatActivity() {
             if (safeVideos.length() == 0) return
             val now = System.currentTimeMillis()
             val key = "$sourceOrigin|$frameId"
+            t.frameVideoMessageCount++
+            t.frameReportedLightVideoCount = maxOf(t.frameReportedLightVideoCount, incoming.optInt("lightVideoCount", 0).coerceIn(0, 12))
+            t.frameReportedShadowVideoCount = maxOf(t.frameReportedShadowVideoCount, incoming.optInt("shadowVideoCount", 0).coerceIn(0, 12))
             val stored = JSONObject().put("origin", sourceOrigin).put("frameId", frameId)
+                .put("isTop", incoming.optBoolean("isTop", false))
                 .put("at", now).put("videos", safeVideos).toString()
             t.frameVideoStates.remove(key)
             t.frameVideoStates[key] = stored
@@ -1716,6 +1797,10 @@ class MainActivity : AppCompatActivity() {
                 t.url = url
                 t.title = v.title ?: url
                 addHistory(t.title, url)
+                // Safety net for the main document: even when the document-start script
+                // was registered but did not execute in this provider, install the same
+                // idempotent observer after navigation. Child frames still use document-start.
+                try { v.evaluateJavascript(EARLY_API_CAPTURE_JS, null) } catch (_: Exception) {}
                 scan(t)
             }
 
@@ -1898,6 +1983,11 @@ class MainActivity : AppCompatActivity() {
         t.sniffed.clear()
         t.requestContexts.clear()
         t.frameApiPayloads.clear()
+        t.frameProbeStates.clear()
+        t.frameProbeMessageCount = 0
+        t.frameVideoMessageCount = 0
+        t.frameReportedLightVideoCount = 0
+        t.frameReportedShadowVideoCount = 0
         t.frameVideoStates.clear()
         t.primaryFrameOrigin = ""
         t.primaryFrameId = ""
@@ -2559,6 +2649,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun showDiscoveryDiagnostics(t: Tab, heading: String) {
         val kinds = t.media.values.groupingBy { it.captureSource.ifBlank { it.origin } }.eachCount()
+        val probeSnapshots = t.frameProbeStates.values.mapNotNull { encoded ->
+            try { JSONObject(encoded) } catch (_: Exception) { null }
+        }
+        val mainFrameProbes = probeSnapshots.count { it.optBoolean("isTop", false) }
+        val childFrameProbes = probeSnapshots.size - mainFrameProbes
+        val probeProtocols = probeSnapshots.map { it.optString("protocol") }.filter { it.isNotBlank() }.distinct()
         val message = buildString {
             append(heading).append("\n\n")
             append("هوية الفيديو الرئيسي: ").append(if (t.primaryVideoId.isNullOrBlank()) "غير محددة" else "محددة").append("\n")
@@ -2567,9 +2663,20 @@ class MainActivity : AppCompatActivity() {
             append("طلبات تنتظر ربطها بالفيديو: ").append(t.pageRequests.size).append("\n")
             append("سياقات طلبات محفوظة: ").append(t.requestContexts.size).append("\n")
             append("رسائل API من الإطارات: ").append(t.frameApiPayloads.size).append("\n")
-            append("إطارات أرسلت حالة فيديو: ").append(t.frameVideoStates.size).append("\n")
+            append("نبضات تشغيل السكربت: ").append(t.frameProbeStates.size)
+                .append(" (الصفحة الرئيسية ").append(mainFrameProbes)
+                .append(" / الإطارات الفرعية ").append(childFrameProbes)
+                .append(" / إجمالي الرسائل ").append(t.frameProbeMessageCount).append(")\n")
+            if (probeProtocols.isNotEmpty()) append("بروتوكولات الإطارات المرصودة: ").append(probeProtocols.joinToString()).append("\n")
+            append("إطارات أرسلت حالة فيديو: ").append(t.frameVideoStates.size)
+                .append(" (إجمالي الرسائل ").append(t.frameVideoMessageCount).append(")\n")
+            append("عناصر فيديو مرصودة: DOM=").append(t.frameReportedLightVideoCount)
+                .append(" / Shadow DOM=").append(t.frameReportedShadowVideoCount).append("\n")
+            append("جسر WebMessage Listener: ").append(if (t.frameBridgeRegistered) "مسجل" else "لم يسجل")
+            if (t.frameBridgeError.isNotBlank()) append(" — ").append(t.frameBridgeError)
+            append("\n")
             append("إطار الفيديو الرئيسي: ").append(if (t.primaryFrameOrigin.isBlank()) "غير محدد" else Uri.parse(t.primaryFrameOrigin).host ?: "محدد").append("\n")
-            append("Document Start Script: ").append(if (t.documentStartCaptureInstalled) "مثبت" else "غير متاح/لم يثبت").append("\n")
+            append("Document Start Script: ").append(if (t.documentStartCaptureInstalled) "ثبتت واجهة التسجيل" else "غير متاح/لم يثبت").append("\n")
             append("Web Message Listener: ").append(if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) "مدعوم" else "غير مدعوم").append("\n")
             append("مصادر Resolver الحالية: ").append(t.media.size).append("\n")
             append("مصادر ضمن آخر محاولة تحليل: ").append(t.lastResolveCandidateCount).append("\n")

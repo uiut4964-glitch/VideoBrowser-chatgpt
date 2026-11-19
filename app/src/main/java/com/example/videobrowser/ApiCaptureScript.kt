@@ -9,8 +9,14 @@ internal const val EARLY_API_CAPTURE_JS = """
 (function () {
   'use strict';
   try {
-    if (!/^https?:$/i.test(String(location.protocol || ''))) return;
-    if (window.__vbApiObserverInstalled) return;
+    var frameIsTop = false;
+    try { frameIsTop = window === window.top; } catch (_) { frameIsTop = false; }
+    var currentProtocol = String(location.protocol || '').toLowerCase();
+    // about:blank/srcdoc child frames can inherit the embedding page's origin and may
+    // host the actual player. Do not skip those frames merely because their URL is about:.
+    if (!/^https?:$/.test(currentProtocol) && !(currentProtocol === 'about:' && !frameIsTop)) return;
+    // Do not return when another copy already wrapped Fetch/XHR: the frame/video
+    // observer below is independently installed and must still get a chance to run.
     window.__vbApiObserverInstalled = true;
     window.__vbApiPayloads = window.__vbApiPayloads || [];
 
@@ -258,13 +264,34 @@ internal const val EARLY_API_CAPTURE_JS = """
 
     // Cross-origin players may contain the only VIDEO element while the top document has none.
     // Report bounded, non-secret player state directly to the native WebMessageListener.
-    if (window !== window.top && !window.__vbFrameVideoObserverInstalled) {
+    if (!window.__vbFrameVideoObserverInstalled) {
       window.__vbFrameVideoObserverInstalled = true;
       var frameId = Math.random().toString(36).slice(2) + Date.now().toString(36);
       var frameVideoCounter = 0;
       var frameVideoLast = Object.create(null);
       var pointerState = { x: -1, y: -1, at: 0 };
       var frameAdPattern = /(?:doubleclick|googlesyndication|googleadservices|imasdk|vasttag|adservice|adserver|preroll|midroll|postroll)/i;
+      var observedRoots = [];
+      var scanScheduled = false;
+
+      function sendFrameProbe(phase, lightCount, shadowCount, rootCount) {
+        try {
+          var bridge = window.VideoBrowserCapture;
+          if (!bridge || typeof bridge.postMessage !== 'function') return false;
+          bridge.postMessage(JSON.stringify({
+            kind: 'frame-probe', frameId: frameId, frameOrigin: String(location.origin || ''),
+            phase: String(phase || 'scan'), protocol: currentProtocol,
+            isTop: frameIsTop, readyState: String(document.readyState || ''),
+            lightVideoCount: Number(lightCount || 0), shadowVideoCount: Number(shadowCount || 0),
+            shadowRootCount: Number(rootCount || 0), bridgeReady: true, at: Date.now()
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      // A probe is emitted even when no <video> element exists. This distinguishes
+      // injection/bridge failures from canvas players and DOM/Shadow-DOM discovery gaps.
+      sendFrameProbe('document-start', 0, 0, 0);
 
       function frameVisible(video) {
         try {
@@ -334,12 +361,74 @@ internal const val EARLY_API_CAPTURE_JS = """
         return result;
       }
 
+      function observeShadowRoot(root) {
+        try {
+          if (!root || observedRoots.indexOf(root) >= 0 || !window.MutationObserver) return;
+          if (observedRoots.length >= 24) return;
+          observedRoots.push(root);
+          var observer = new MutationObserver(scheduleFrameScan);
+          observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src','data-src','class','style'] });
+        } catch (_) {}
+      }
+
+      function collectFrameVideos() {
+        var result = [];
+        var roots = [document];
+        var seenRoots = [];
+        var shadowRoots = 0;
+        var scannedNodes = 0;
+        for (var ri = 0; ri < roots.length && ri < 24 && scannedNodes < 2600; ri++) {
+          var root = roots[ri];
+          if (!root || seenRoots.indexOf(root) >= 0) continue;
+          seenRoots.push(root);
+          observeShadowRoot(root);
+          try {
+            var directVideos = root.querySelectorAll('video');
+            for (var vi = 0; vi < directVideos.length && result.length < 12; vi++) {
+              if (result.indexOf(directVideos[vi]) < 0) result.push(directVideos[vi]);
+            }
+          } catch (_) {}
+          try {
+            var elements = root.querySelectorAll('*');
+            var limit = Math.min(elements.length, 1800 - scannedNodes);
+            for (var ei = 0; ei < limit && roots.length < 24; ei++) {
+              scannedNodes++;
+              var shadow = elements[ei] && elements[ei].shadowRoot;
+              if (shadow && seenRoots.indexOf(shadow) < 0 && roots.indexOf(shadow) < 0) {
+                roots.push(shadow);
+                shadowRoots++;
+              }
+            }
+          } catch (_) {}
+        }
+        return { videos: result.slice(0, 12), shadowRoots: shadowRoots };
+      }
+
+      function scheduleFrameScan() {
+        if (scanScheduled) return;
+        scanScheduled = true;
+        setTimeout(function(){ scanScheduled = false; sendFrameVideoState(); }, 180);
+      }
+
       function sendFrameVideoState() {
         try {
           var bridge = window.VideoBrowserCapture;
           if (!bridge || typeof bridge.postMessage !== 'function') return;
-          var nodes = document.querySelectorAll('video');
+          var found = collectFrameVideos();
+          var nodes = found.videos;
+          var lightVideoCount = 0;
+          var shadowVideoCount = 0;
+          for (var ci = 0; ci < nodes.length; ci++) {
+            try {
+              var rootNode = nodes[ci].getRootNode ? nodes[ci].getRootNode() : document;
+              if (rootNode && rootNode !== document) shadowVideoCount++; else lightVideoCount++;
+            } catch (_) { lightVideoCount++; }
+          }
           var videos = [];
+          if (!nodes.length) {
+            sendFrameProbe('scan-no-video', 0, 0, found.shadowRoots);
+            return;
+          }
           for (var i = 0; i < Math.min(nodes.length, 8); i++) {
             var video = nodes[i];
             if (!video) continue;
@@ -379,8 +468,11 @@ internal const val EARLY_API_CAPTURE_JS = """
           if (!videos.length) return;
           bridge.postMessage(JSON.stringify({
             kind: 'frame-video-state', frameId: frameId, frameOrigin: String(location.origin || ''),
+            isTop: frameIsTop, shadowRootCount: found.shadowRoots,
+            lightVideoCount: lightVideoCount, shadowVideoCount: shadowVideoCount,
             at: Date.now(), videos: videos
           }));
+          sendFrameProbe('scan-video-found', lightVideoCount, shadowVideoCount, found.shadowRoots);
         } catch (_) {}
       }
 
@@ -397,11 +489,9 @@ internal const val EARLY_API_CAPTURE_JS = """
         document.addEventListener(name, function(){ sendFrameVideoState(); }, true);
       });
       try {
-        if (window.MutationObserver) {
-          new MutationObserver(function(){ sendFrameVideoState(); }).observe(document, { childList: true, subtree: true });
-        }
+        if (window.MutationObserver) observeShadowRoot(document);
       } catch (_) {}
-      if (window.setInterval) window.setInterval(sendFrameVideoState, 1200);
+      if (window.setInterval) window.setInterval(function(){ sendFrameProbe('periodic', 0, 0, observedRoots.length - 1); sendFrameVideoState(); }, 1500);
       sendFrameVideoState();
     }
   } catch (_) {}
