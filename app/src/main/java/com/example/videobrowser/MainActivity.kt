@@ -2913,7 +2913,7 @@ class MainActivity : AppCompatActivity() {
             append("إعدادات مشغل مرصودة: ").append(t.playerConfigObjectCount)
                 .append(" / mediaDefinitions: ").append(t.playerMediaDefinitionCount)
             if (t.playerDefinitionQualities.isNotBlank()) append(" / الجودات: ").append(t.playerDefinitionQualities)
-            if (t.playerVideoDurationSec > 0.0) append(" / مدة المحتوى المعلنة: ").append(String.format(Locale.US, "%.0f ثانية", t.playerVideoDurationSec))
+            if (t.playerVideoDurationSec > 0.0) append(" / مدة المحتوى المعلنة: ").append(String.format(java.util.Locale.US, "%.0f ثانية", t.playerVideoDurationSec))
             if (t.playerAdReason.isNotBlank()) append(" / إشارة الإعلان: ").append(t.playerAdReason)
             append("\n")
             append("جسر WebMessage Listener: ").append(if (t.frameBridgeRegistered) "مسجل" else "لم يسجل")

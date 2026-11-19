@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.videobrowser"
         minSdk = 29
         targetSdk = 34
-        versionCode = 18
-        versionName = "1.11.5"
+        versionCode = 19
+        versionName = "1.11.5.1"
     }
 
     // توقيع ثابت: يسمح بتثبيت كل نسخة جديدة فوق السابقة دون حذف التطبيق وبياناته

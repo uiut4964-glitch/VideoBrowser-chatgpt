@@ -1,3 +1,15 @@
+# VideoBrowser 1.11.5.1 – Stage 3.5 Build Fix
+
+إصلاح تجميع صغير للإصدار 1.11.5: تم تأهيل استدعاء `Locale.US` في تقرير التشخيص باسم `java.util.Locale.US` لأن `MainActivity.kt` لم يكن يستورد `java.util.Locale`.
+
+- Version Code: 19.
+- لم يتغير منطق التقاط الفيديو أو تحليل الجودات أو تصنيف الإعلان.
+- لم يتغير `DownloadCenter.kt` أو `Hls.kt`.
+- أُعيد تشغيل اختبارات JavaScript واختبارات Kotlin للمحللات واحتياط NetProbe؛ جميعها نجحت.
+- لم يُنفذ Android `assembleDebug` في بيئة إعداد الحزمة؛ يجب تأكيد BUILD SUCCESSFUL عبر GitHub Actions.
+
+---
+
 # VideoBrowser 1.11.5 – Stage 3.5
 
 تصحيح مرحلة فحص مصادر المشغل التي عادت HTTP 410.
