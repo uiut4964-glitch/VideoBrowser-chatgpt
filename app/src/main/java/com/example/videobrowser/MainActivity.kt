@@ -1917,7 +1917,10 @@ class MainActivity : AppCompatActivity() {
                 val u = r.url.toString()
                 // Snapshot only allowlisted request headers while still on the request callback.
                 // This callback is passive: returning null lets WebView perform the original request.
-                if (!r.isForMainFrame && r.method.equals("GET", true) && isCandidateMediaRequest(u)) {
+                // Player-declared rendition URLs may be opaque (no extension or quality query).
+                // Capture their safe request context too; rec() will retain it only when the
+                // URL is a real media candidate or matches a prepared player rendition.
+                if (!r.isForMainFrame && r.method.equals("GET", true) && isCandidatePlayerSource(u)) {
                     val captured = MediaCaptureCoordinator.snapshot(
                         url = u,
                         method = r.method,
@@ -2129,14 +2132,26 @@ class MainActivity : AppCompatActivity() {
 
     private fun syncMedia(t: Tab) {
         t.media.clear()
-        t.preparedMedia.forEach { (url, item) -> t.media[url] = item }
         val id = t.primaryVideoId
+        val now = System.currentTimeMillis()
+        t.preparedMedia.forEach { (url, item) ->
+            val context = t.requestContexts[url]
+            val freshContext = context?.takeIf {
+                CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin, t.url, now)
+            }
+            val headers = if (freshContext != null) CaptureHeaders.merge(item.requestHeaders, freshContext.headers) else item.requestHeaders
+            t.media[url] = if (headers == item.requestHeaders) item else MediaItem(
+                item.url, item.type, item.origin, item.videoId, item.sourceEpoch, item.qualityHint,
+                item.widthHint, item.heightHint, item.mimeHint, headers,
+                item.captureSource.ifBlank { freshContext?.source.orEmpty() }, item.codecHint,
+                item.frameRateHint, item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint
+            )
+        }
         if (id != null && !t.primaryIsAd && !t.suspectedPreroll) {
-            val now = System.currentTimeMillis()
             t.sniffed.values
                 .filter { it.videoId == id && it.sourceEpoch == t.primarySourceEpoch && now - it.requestedAt in 0L..180_000L }
                 .forEach { captured ->
-                    if (isCandidateMediaRequest(captured.url)) {
+                    if (isCandidateMediaRequest(captured.url) || t.preparedMedia.containsKey(captured.url)) {
                         // لا تسمح لالتقاط الشبكة الخام بأن يمحو بيانات الجودة التي استخرجناها
                         // مسبقًا من إعدادات المشغل لنفس الرابط (خصوصًا signed URLs بلا امتداد).
                         val prepared = t.preparedMedia[captured.url] ?: t.media[captured.url]
@@ -2369,7 +2384,11 @@ class MainActivity : AppCompatActivity() {
         if (!isCandidatePlayerSource(url)) return
         val type = if (isHlsUrl(url) || meta?.optString("mime", "")?.contains("mpegurl", true) == true) "hls" else "direct"
         val origin = if (t.primaryIsAd || t.suspectedPreroll) "dom-preroll" else "dom"
-        val previous = t.preparedMedia[url]
+        // Never carry metadata or request headers from an older source generation (for
+        // example a preroll ad) into a newly selected content rendition that reused a URL.
+        val previous = t.preparedMedia[url]?.takeIf {
+            it.videoId == videoId && it.sourceEpoch == t.primarySourceEpoch
+        }
         val quality = meta?.optString("label")?.takeIf { it.isNotBlank() } ?: previous?.qualityHint.orEmpty()
         val width = meta?.optInt("width", 0)?.takeIf { it > 0 } ?: previous?.widthHint ?: 0
         val height = meta?.optInt("height", 0)?.takeIf { it > 0 } ?: previous?.heightHint ?: 0
@@ -2404,8 +2423,10 @@ class MainActivity : AppCompatActivity() {
         t.pageRequests.entries.removeAll { now - it.value !in 0L..90_000L }
         t.pageRequests.forEach { (url, time) ->
             if (now - time <= 90_000L && isCandidateMediaRequest(url)) {
-                if (isAd) t.pendingSniffed[url] = time
-                else t.sniffed[url] = SniffedMedia(url, time, id, epoch, false, t.requestContexts[url])
+                if (isAd) {
+                    t.pendingSniffed[url] = time
+                    t.requestContexts[url]?.let { t.requestContexts[url] = it.copy(capturedDuringAd = true) }
+                } else t.sniffed[url] = SniffedMedia(url, time, id, epoch, false, t.requestContexts[url])
             }
         }
         t.pageRequests.clear()
@@ -2418,6 +2439,7 @@ class MainActivity : AppCompatActivity() {
             // لا نسقط روابط MP4/المصادر المنفصلة التي جهزها المشغل قبل انتهاء الإعلان.
             // يتم التحقق من مدة الملف المباشر ونوعه لاحقًا في Formats.resolve قبل عرضه.
             if (now - time <= 180_000L && isCandidateMediaRequest(url) && !isExcludedMediaUrl(url)) {
+                t.requestContexts[url]?.let { t.requestContexts[url] = it.copy(capturedDuringAd = true) }
                 t.sniffed[url] = SniffedMedia(url, time, id, epoch, true, t.requestContexts[url])
             }
         }
@@ -2492,17 +2514,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun rec(t: Tab, request: CapturedMediaRequest) {
         val url = request.url
-        if (request.method != "GET" || !isCandidateMediaRequest(url)) return
+        if (request.method != "GET" || !isCandidatePlayerSource(url)) return
+        val knownPreparedSource = t.preparedMedia.containsKey(url) || t.media.containsKey(url)
+        val mediaCandidate = isCandidateMediaRequest(url)
         val now = request.capturedAt
         // Keep only recent, allowlisted request context in memory. Cookies are resolved
         // from CookieManager later; Authorization/Cookie headers are never copied here.
+        // Keep opaque player URLs as context-only until the matching mediaDefinitions
+        // entry arrives; do not promote unrelated API endpoints to downloadable media.
+        val safeContext = request.copy(capturedDuringAd = t.primaryIsAd || t.suspectedPreroll)
         t.requestContexts.remove(url)
-        t.requestContexts[url] = request
+        t.requestContexts[url] = safeContext
         t.requestContexts.entries.removeAll { now - it.value.capturedAt !in 0L..180_000L }
         while (t.requestContexts.size > 120) {
             val oldest = t.requestContexts.keys.firstOrNull() ?: break
             t.requestContexts.remove(oldest)
         }
+        if (!mediaCandidate && !knownPreparedSource) return
 
         // قد تُطلب قائمة الجودة قبل أن يكتمل أول فحص DOM؛ احتفظ بمرشحات قصيرة العمر
         // حتى نحدد عنصر الفيديو الرئيسي ثم نربطها به بدل إسقاطها.
@@ -2527,7 +2555,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        t.sniffed[url] = SniffedMedia(url, now, id, t.primarySourceEpoch, false, request)
+        t.sniffed[url] = SniffedMedia(url, now, id, t.primarySourceEpoch, false, safeContext)
         while (t.sniffed.size > 80) {
             val oldest = t.sniffed.keys.firstOrNull() ?: break
             t.sniffed.remove(oldest)
@@ -2799,6 +2827,9 @@ class MainActivity : AppCompatActivity() {
             append("مصادر الشبكة المرتبطة: ").append(t.sniffed.size).append("\n")
             append("طلبات تنتظر ربطها بالفيديو: ").append(t.pageRequests.size).append("\n")
             append("سياقات طلبات محفوظة: ").append(t.requestContexts.size).append("\n")
+            append("سياقات مرتبطة بروابط المشغل: ").append(t.preparedMedia.count { (url, _) ->
+                t.requestContexts[url]?.let { CaptureHeaders.matchesPreparedSource(url, it, t.primaryFrameOrigin) } == true
+            }).append("\n")
             append("رسائل API من الإطارات: ").append(t.frameApiPayloads.size).append("\n")
             append("نبضات تشغيل السكربت: ").append(t.frameProbeStates.size)
                 .append(" (الصفحة الرئيسية ").append(mainFrameProbes)

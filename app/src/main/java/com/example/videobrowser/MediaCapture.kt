@@ -9,7 +9,8 @@ data class CapturedMediaRequest(
     val source: String,
     val isMainFrame: Boolean,
     val hasGesture: Boolean,
-    val capturedAt: Long = System.currentTimeMillis()
+    val capturedAt: Long = System.currentTimeMillis(),
+    val capturedDuringAd: Boolean = false
 )
 
 /**
@@ -59,6 +60,38 @@ object CaptureHeaders {
         } catch (_: Exception) {
             ""
         }
+    }
+
+    /**
+     * A browser request context may be attached only to the exact player-declared URL,
+     * while fresh and from the selected player frame. Ad-time contexts are never reused
+     * for the content rendition after a preroll transition.
+     */
+    fun matchesPreparedSource(
+        preparedUrl: String,
+        request: CapturedMediaRequest,
+        primaryFrameOrigin: String,
+        topPageUrl: String = "",
+        nowMillis: Long = System.currentTimeMillis(),
+        maxAgeMillis: Long = 180_000L
+    ): Boolean {
+        if (request.url != preparedUrl || !request.method.equals("GET", true) || request.capturedDuringAd) return false
+        if (nowMillis - request.capturedAt !in 0L..maxAgeMillis) return false
+        val expectedOrigin = webOrigin(primaryFrameOrigin)
+        val topOrigin = webOrigin(topPageUrl)
+        val requestOrigin = webOrigin(request.pageUrl)
+        return requestOrigin == null || expectedOrigin == null || requestOrigin == expectedOrigin || requestOrigin == topOrigin
+    }
+
+    private fun webOrigin(raw: String): String? {
+        return try {
+            val uri = java.net.URI(raw.trim())
+            val scheme = uri.scheme?.lowercase() ?: return null
+            val host = uri.host?.lowercase() ?: return null
+            if (scheme != "http" && scheme != "https") return null
+            val port = if (uri.port == -1 || (scheme == "https" && uri.port == 443) || (scheme == "http" && uri.port == 80)) "" else ":${uri.port}"
+            "$scheme://$host$port"
+        } catch (_: Exception) { null }
     }
 
     /** Request-specific values override the page-level fallback values. */

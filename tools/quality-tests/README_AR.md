@@ -1,4 +1,4 @@
-# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.3 / Stage 3.3 – Blob/MSE renditions and frame playback
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.4 / Stage 3.4 – Blob/MSE renditions and frame playback
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 
@@ -28,6 +28,8 @@ node test_frame_probe_shadow.js
 - اختبار بقاء تمثيلين HLS لهما الدقة نفسها لكن يختلفان في AVC/HEVC وSDR/PQ ومعدل الإطارات.
 - اختبار بقاء تمثيل مباشر معلن من المشغل عند رفض CDN لفحص Range، دون اختلاق حجم الملف.
 - اختبار عدم إسقاط مصدر فيديو صغير عندما تكون بيانات النوع والدقة معلنة وموثوقة.
+- اختبار ربط سياق طلب WebView برابط player-declared opaque مطابق حرفيًا، مع منع إعادة استخدام سياق الإعلان أو سياق إطار مختلف أو سياق منتهي الصلاحية.
+- فحص CDN: عند رفض Range، يُجرّب HEAD ثم GET دون Range لقراءة الرؤوس فقط؛ لا يُقرأ جسم الفيديو في مرحلة الفحص.
 
 ## اختبارات Kotlin للمحلل وResolver
 
@@ -54,6 +56,15 @@ java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsMasterT
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsFormatsResolveTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.DirectQualityMetadataTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.CaptureHeadersTestKt
+
+# Net probe fallback test (uses the local JVM HTTP server; no external network)
+kotlinc tools/quality-tests/android/content/Context.kt \
+  tools/quality-tests/android/net/ConnectivityManager.kt \
+  tools/quality-tests/android/webkit/CookieManager.kt \
+  app/src/main/java/com/example/videobrowser/Net.kt \
+  tools/quality-tests/NetProbeFallbackTest.kt \
+  -include-runtime -d /tmp/vb-net-probe-test.jar
+java --add-modules jdk.httpserver -jar /tmp/vb-net-probe-test.jar
 ```
 
 `NetTestSupport.kt` وملفات `android/*` بدائل اختبار فقط؛ لا تنقلها إلى `app/src/main`.

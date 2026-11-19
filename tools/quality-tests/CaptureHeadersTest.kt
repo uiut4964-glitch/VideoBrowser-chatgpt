@@ -32,5 +32,24 @@ fun main() {
     check(merged["Accept"] == "video/*")
     check(merged.keys.count { it.equals("User-Agent", true) } == 1)
 
-    println("Capture headers test passed: allowlist, secret-header exclusion, and request-over-fallback merge")
+    val opaqueUrl = "https://cdn.example/cdn/path/v?token=opaque"
+    val playerContext = CapturedMediaRequest(
+        url = opaqueUrl,
+        pageUrl = "https://site.example/watch/42",
+        method = "GET",
+        headers = captured,
+        source = "webview",
+        isMainFrame = false,
+        hasGesture = true,
+        capturedAt = 1_000L
+    )
+    check(CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L))
+    val thirdPartyFrameContext = playerContext.copy(pageUrl = "https://site.example/watch/42")
+    check(CaptureHeaders.matchesPreparedSource(opaqueUrl, thirdPartyFrameContext, "https://player.cdn.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L))
+    check(!CaptureHeaders.matchesPreparedSource("https://cdn.example/other", playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L))
+    check(!CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext.copy(capturedDuringAd = true), "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 2_000L))
+    check(!CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext, "https://other.example", topPageUrl = "https://other.example/watch/42", nowMillis = 2_000L))
+    check(!CaptureHeaders.matchesPreparedSource(opaqueUrl, playerContext, "https://site.example", topPageUrl = "https://site.example/watch/42", nowMillis = 200_000L))
+
+    println("Capture headers test passed: allowlist, secret exclusion, request merge, and safe opaque-source context binding")
 }

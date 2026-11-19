@@ -13,13 +13,14 @@ object Net {
     class Probe(val total: Long, val rangeOk: Boolean, val mime: String)
     data class ContentRange(val start: Long, val end: Long, val total: Long)
 
-    fun connect(url: String, headers: Map<String, String>, range: String? = null): HttpURLConnection {
+    fun connect(url: String, headers: Map<String, String>, range: String? = null, method: String = "GET"): HttpURLConnection {
         var cur = url
         for (i in 0..8) {
             val c = URL(cur).openConnection() as HttpURLConnection
             c.connectTimeout = 15000
             c.readTimeout = 25000
             c.instanceFollowRedirects = false
+            c.requestMethod = method
             c.setRequestProperty("Accept-Encoding", "identity")
             headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
             if (!headers.keys.any { it.equals("Cookie", true) }) {
@@ -51,10 +52,11 @@ object Net {
     }
 
     fun probe(url: String, headers: Map<String, String>): Probe {
+        var rangeFailureCode = -1
         val c = connect(url, headers, "bytes=0-0")
         try {
             val mime = c.contentType?.substringBefore(';')?.trim() ?: ""
-            return when (c.responseCode) {
+            when (val code = c.responseCode) {
                 206 -> {
                     val cr = parseContentRange(c.getHeaderField("Content-Range"))
                         ?: throw IOException("استجابة الخادم لنطاق البايتات غير صالحة")
@@ -62,13 +64,46 @@ object Net {
                         (c.contentLengthLong >= 0L && c.contentLengthLong != 1L)) {
                         throw IOException("الخادم أعاد نطاق بايتات غير مطابق لطلب الفحص")
                     }
-                    Probe(cr.total, true, mime)
+                    return Probe(cr.total, true, mime)
                 }
-                200 -> Probe(c.contentLengthLong, false, mime)
-                else -> throw IOException("HTTP ${c.responseCode}")
+                200 -> return Probe(c.contentLengthLong, false, mime)
+                // Some media CDNs reject a byte-range probe even when the rendition
+                // remains available through a normal request. Verify availability
+                // without downloading its body before declaring the source expired.
+                403, 405, 410, 416, 501 -> rangeFailureCode = code
+                else -> throw IOException("HTTP $code")
             }
         } finally {
             c.disconnect()
+        }
+        return probeWithoutRange(url, headers, rangeFailureCode)
+    }
+
+    /**
+     * Verify a media URL rejected by the Range probe. HEAD is preferred; if unsupported
+     * or blocked, a normal GET is opened only long enough to read response headers and is
+     * immediately disconnected. No media bytes are consumed here.
+     */
+    private fun probeWithoutRange(url: String, headers: Map<String, String>, rangeCode: Int): Probe {
+        var headCode = -1
+        val head = connect(url, headers, method = "HEAD")
+        try {
+            headCode = head.responseCode
+            val mime = head.contentType?.substringBefore(';')?.trim() ?: ""
+            if (headCode in 200..299) return Probe(head.contentLengthLong, false, mime)
+        } finally {
+            head.disconnect()
+        }
+
+        val get = connect(url, headers)
+        try {
+            val code = get.responseCode
+            val mime = get.contentType?.substringBefore(';')?.trim() ?: ""
+            if (code in 200..299) return Probe(get.contentLengthLong, false, mime)
+            throw IOException("HTTP $code (فشل فحص Range: HTTP $rangeCode، وHEAD: HTTP $headCode)")
+        } finally {
+            // Do not call inputStream/readBytes here: this is a headers-only availability check.
+            get.disconnect()
         }
     }
 
