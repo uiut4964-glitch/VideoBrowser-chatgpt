@@ -202,6 +202,9 @@
       var seen = Object.create(null);
       var sourceMeta = Object.create(null);
       var activeApiContext = null;
+      var flashvarsObjectCount = 0;
+      var flashvarsDefinitionCount = 0;
+      var flashvarsQualities = [];
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -217,6 +220,7 @@
         if (incoming.dynamicRange && !existing.dynamicRange) existing.dynamicRange = incoming.dynamicRange;
         if (incoming.bandwidth && !existing.bandwidth) existing.bandwidth = incoming.bandwidth;
         if (incoming.representationId && !existing.representationId) existing.representationId = incoming.representationId;
+        if (meta && meta.captureSource && !existing.captureSource) existing.captureSource = String(meta.captureSource).slice(0, 80);
         if (activeApiContext) {
           if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
             existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
@@ -305,6 +309,40 @@
         for (var cr = 0; cr < configRoots.length; cr++) {
           var configValue = window[configRoots[cr]];
           if (configValue) parsePlayerConfig(configValue, add, 0, true);
+        }
+        // Pornhub-style players expose the complete rendition list in window.flashvars_<id>.
+        // Read only the explicit mediaDefinitions array, not arbitrary page globals.
+        var flashvarsNames = Object.keys(window).filter(function(name){ return /^flashvars(?:_\d+)?$/i.test(name); }).slice(0, 12);
+        flashvarsObjectCount = flashvarsNames.length;
+        for (var fi = 0; fi < flashvarsNames.length; fi++) {
+          var flashvars = window[flashvarsNames[fi]];
+          if (!flashvars || typeof flashvars !== 'object') continue;
+          var definitions = flashvars.mediaDefinitions;
+          if (!Array.isArray(definitions)) continue;
+          flashvarsDefinitionCount += definitions.length;
+          for (var fd = 0; fd < Math.min(definitions.length, 64); fd++) {
+            var definition = definitions[fd];
+            if (!definition || typeof definition !== 'object') continue;
+            var definitionUrl = definition.videoUrl || definition.video_url || definition.url || '';
+            if (!definitionUrl) continue;
+            var formatName = String(definition.format || definition.type || '').toLowerCase();
+            var qualityValue = definition.quality;
+            var qualityNumber = Array.isArray(qualityValue) ? 0 : Number(String(qualityValue || '').match(/\d{3,4}/)?.[0] || 0);
+            if (definition.isAd === true || definition.ad === true || /^(ad|advertisement)$/i.test(String(definition.role || '')) || isAdUrl(definitionUrl)) continue;
+            if (qualityNumber > 0 && flashvarsQualities.indexOf(qualityNumber + 'p') < 0 && flashvarsQualities.length < 16) flashvarsQualities.push(qualityNumber + 'p');
+            var definitionMeta = {
+              captureSource: 'player-flashvars',
+              mime: /^(hls|m3u8|mpegurl)$/.test(formatName) ? 'application/vnd.apple.mpegurl' :
+                (/^(mp4|webm|quicktime)$/.test(formatName) ? 'video/' + formatName : ''),
+              label: qualityNumber > 0 ? qualityNumber + 'p' : '',
+              height: qualityNumber > 0 ? qualityNumber : 0,
+              codec: definition.codecs || definition.codec || '',
+              frameRate: Number(definition.frameRate || definition.fps || 0),
+              bandwidth: Number(definition.bandwidth || definition.bitrate || 0),
+              representationId: definition.id || definition.formatId || ''
+            };
+            add(definitionUrl, definitionMeta);
+          }
         }
         var nextData = window.__NEXT_DATA__;
         if (nextData && nextData.props && nextData.props.pageProps) {
@@ -563,9 +601,12 @@
         add(v.getAttribute('src'), {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
         add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
+      v.__vbFlashvarsStats = { objects:flashvarsObjectCount, definitions:flashvarsDefinitionCount, qualities:flashvarsQualities.slice(0, 16) };
       v.__vbSourceMeta = out.slice(0, 128).map(function(u){
         var m = sourceMeta[u] || {};
         return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || '',
+          codec:m.codec || '', frameRate:Number(m.frameRate || 0), dynamicRange:m.dynamicRange || '',
+          bandwidth:Number(m.bandwidth || 0), representationId:m.representationId || '',
           requestHeaders:m.requestHeaders || {}, captureSource:m.captureSource || ''};
       });
       return out.slice(0, 128);
@@ -764,6 +805,9 @@
         cycle: Number(pv.__vbCycle || 0), ad: !!pad,
         adContainer: hasAdMarker(pv) || hasVisibleAdOverlay(pv), poster: absUrl(pv.poster || ''),
         duration: Number(pv.duration || 0),
+        playerConfigObjectCount: Number((pv.__vbFlashvarsStats || {}).objects || 0),
+        playerMediaDefinitionCount: Number((pv.__vbFlashvarsStats || {}).definitions || 0),
+        playerDefinitionQualities: (pv.__vbFlashvarsStats || {}).qualities || [],
         suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
           (pSources.length === 0 || pSources.some(function(u){ return u !== psrc; })) && !pv.__vbContentTransition,
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))

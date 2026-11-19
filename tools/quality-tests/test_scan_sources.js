@@ -22,6 +22,12 @@ const document = {
 const window = {
   innerWidth: 1200, innerHeight: 800,
   location: {href: document.baseURI},
+  flashvars_987: { mediaDefinitions: [
+    {format:'hls', quality:1080, videoUrl:'https://cdn.example/flashvars-1080.m3u8'},
+    {format:'hls', quality:720, videoUrl:'https://cdn.example/flashvars-720.m3u8'},
+    {format:'mp4', quality:480, videoUrl:'https://cdn.example/flashvars-480.mp4'},
+    {format:'mp4', quality:360, videoUrl:'https://cdn.example/ads/spot-360.mp4', isAd:true}
+  ]},
   playerConfig: {sources: [
     {label:'240p', height:240, type:'video/mp4', src:'https://cdn.example/main-240.mp4'},
     {label:'480p', height:480, type:'video/mp4', src:'https://cdn.example/main-480.mp4'},
@@ -39,10 +45,18 @@ const expected = [240,480,720,1080];
 for (const q of expected) {
   if (!sources.some(u => u.includes(`main-${q}.mp4`))) throw new Error(`Missing quality ${q}p: ${sources.join(',')}`);
 }
+for (const q of [480, 720, 1080]) {
+  const url = result.p.sources.find(item => item.includes(`flashvars-${q}`));
+  if (!url) throw new Error(`Missing flashvars mediaDefinition quality ${q}p`);
+  const meta = result.p.sourceMeta.find(x => x.url === url);
+  if (!meta || meta.height !== q || meta.captureSource !== 'player-flashvars') throw new Error(`Missing flashvars source metadata ${q}p`);
+}
 for (const q of expected) {
   const meta = result.p.sourceMeta.find(x => x.url.includes(`main-${q}.mp4`));
   if (!meta || meta.height !== q || !String(meta.label).toLowerCase().includes(String(q))) {
     throw new Error(`Missing quality metadata ${q}p: ${JSON.stringify(meta)}`);
   }
 }
-console.log(`player-config extraction passed: ${expected.length} explicit quality sources and their height/label metadata captured`);
+if (sources.some(u => u.includes('/ads/spot-360.mp4'))) throw new Error('Explicit ad definition leaked into content sources');
+if ((result.p.playerDefinitionQualities || []).includes('360p')) throw new Error('Explicit ad quality leaked into content quality diagnostics');
+console.log(`player-config extraction passed: ${expected.length} explicit quality sources and their height/label metadata captured; explicit ad definition excluded`);

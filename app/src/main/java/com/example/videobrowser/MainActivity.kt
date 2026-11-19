@@ -281,6 +281,9 @@ private const val SCAN_JS = """
       var seen = Object.create(null);
       var sourceMeta = Object.create(null);
       var activeApiContext = null;
+      var flashvarsObjectCount = 0;
+      var flashvarsDefinitionCount = 0;
+      var flashvarsQualities = [];
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -296,6 +299,7 @@ private const val SCAN_JS = """
         if (incoming.dynamicRange && !existing.dynamicRange) existing.dynamicRange = incoming.dynamicRange;
         if (incoming.bandwidth && !existing.bandwidth) existing.bandwidth = incoming.bandwidth;
         if (incoming.representationId && !existing.representationId) existing.representationId = incoming.representationId;
+        if (meta && meta.captureSource && !existing.captureSource) existing.captureSource = String(meta.captureSource).slice(0, 80);
         if (activeApiContext) {
           if (activeApiContext.headers && Object.keys(activeApiContext.headers).length) {
             existing.requestHeaders = Object.assign({}, existing.requestHeaders || {}, activeApiContext.headers);
@@ -384,6 +388,40 @@ private const val SCAN_JS = """
         for (var cr = 0; cr < configRoots.length; cr++) {
           var configValue = window[configRoots[cr]];
           if (configValue) parsePlayerConfig(configValue, add, 0, true);
+        }
+        // Pornhub-style players expose the complete rendition list in window.flashvars_<id>.
+        // Read only the explicit mediaDefinitions array, not arbitrary page globals.
+        var flashvarsNames = Object.keys(window).filter(function(name){ return /^flashvars(?:_\d+)?$/i.test(name); }).slice(0, 12);
+        flashvarsObjectCount = flashvarsNames.length;
+        for (var fi = 0; fi < flashvarsNames.length; fi++) {
+          var flashvars = window[flashvarsNames[fi]];
+          if (!flashvars || typeof flashvars !== 'object') continue;
+          var definitions = flashvars.mediaDefinitions;
+          if (!Array.isArray(definitions)) continue;
+          flashvarsDefinitionCount += definitions.length;
+          for (var fd = 0; fd < Math.min(definitions.length, 64); fd++) {
+            var definition = definitions[fd];
+            if (!definition || typeof definition !== 'object') continue;
+            var definitionUrl = definition.videoUrl || definition.video_url || definition.url || '';
+            if (!definitionUrl) continue;
+            var formatName = String(definition.format || definition.type || '').toLowerCase();
+            var qualityValue = definition.quality;
+            var qualityNumber = Array.isArray(qualityValue) ? 0 : Number(String(qualityValue || '').match(/\d{3,4}/)?.[0] || 0);
+            if (definition.isAd === true || definition.ad === true || /^(ad|advertisement)$/i.test(String(definition.role || '')) || isAdUrl(definitionUrl)) continue;
+            if (qualityNumber > 0 && flashvarsQualities.indexOf(qualityNumber + 'p') < 0 && flashvarsQualities.length < 16) flashvarsQualities.push(qualityNumber + 'p');
+            var definitionMeta = {
+              captureSource: 'player-flashvars',
+              mime: /^(hls|m3u8|mpegurl)$/.test(formatName) ? 'application/vnd.apple.mpegurl' :
+                (/^(mp4|webm|quicktime)$/.test(formatName) ? 'video/' + formatName : ''),
+              label: qualityNumber > 0 ? qualityNumber + 'p' : '',
+              height: qualityNumber > 0 ? qualityNumber : 0,
+              codec: definition.codecs || definition.codec || '',
+              frameRate: Number(definition.frameRate || definition.fps || 0),
+              bandwidth: Number(definition.bandwidth || definition.bitrate || 0),
+              representationId: definition.id || definition.formatId || ''
+            };
+            add(definitionUrl, definitionMeta);
+          }
         }
         var nextData = window.__NEXT_DATA__;
         if (nextData && nextData.props && nextData.props.pageProps) {
@@ -642,9 +680,12 @@ private const val SCAN_JS = """
         add(v.getAttribute('src'), {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
         add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
+      v.__vbFlashvarsStats = { objects:flashvarsObjectCount, definitions:flashvarsDefinitionCount, qualities:flashvarsQualities.slice(0, 16) };
       v.__vbSourceMeta = out.slice(0, 128).map(function(u){
         var m = sourceMeta[u] || {};
         return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || '',
+          codec:m.codec || '', frameRate:Number(m.frameRate || 0), dynamicRange:m.dynamicRange || '',
+          bandwidth:Number(m.bandwidth || 0), representationId:m.representationId || '',
           requestHeaders:m.requestHeaders || {}, captureSource:m.captureSource || ''};
       });
       return out.slice(0, 128);
@@ -843,6 +884,9 @@ private const val SCAN_JS = """
         cycle: Number(pv.__vbCycle || 0), ad: !!pad,
         adContainer: hasAdMarker(pv) || hasVisibleAdOverlay(pv), poster: absUrl(pv.poster || ''),
         duration: Number(pv.duration || 0),
+        playerConfigObjectCount: Number((pv.__vbFlashvarsStats || {}).objects || 0),
+        playerMediaDefinitionCount: Number((pv.__vbFlashvarsStats || {}).definitions || 0),
+        playerDefinitionQualities: (pv.__vbFlashvarsStats || {}).qualities || [],
         suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
           (pSources.length === 0 || pSources.some(function(u){ return u !== psrc; })) && !pv.__vbContentTransition,
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
@@ -891,6 +935,9 @@ class MainActivity : AppCompatActivity() {
         var frameVideoMessageCount = 0
         var frameReportedLightVideoCount = 0
         var frameReportedShadowVideoCount = 0
+        var playerConfigObjectCount = 0
+        var playerMediaDefinitionCount = 0
+        var playerDefinitionQualities = ""
         // Cross-origin/frame player snapshots, held only in memory for the active page.
         val frameVideoStates = LinkedHashMap<String, String>()
         var primaryFrameOrigin = ""
@@ -919,6 +966,10 @@ class MainActivity : AppCompatActivity() {
         @Volatile var lastResolveReport = "لم يبدأ تحليل المصادر بعد"
         @Volatile var lastResolveCandidateCount = 0
         @Volatile var activeId: String? = null
+        // Short-lived native frame playback proof prevents the periodic top-page scan
+        // from clearing the FAB state when the actual player lives inside an iframe.
+        @Volatile var framePlaybackActiveId: String? = null
+        @Volatile var framePlaybackAt = 0L
         val userGestureVideoIds = LinkedHashSet<String>()
         @Volatile var userGestureAt = 0L
         var poster = ""
@@ -1073,6 +1124,8 @@ class MainActivity : AppCompatActivity() {
         cur?.let {
             it.activePlayback = false
             it.activeId = null
+            it.framePlaybackActiveId = null
+            it.framePlaybackAt = 0L
             updateFab()
         }
         saveTabs()
@@ -1302,6 +1355,9 @@ class MainActivity : AppCompatActivity() {
         t.frameVideoMessageCount = 0
         t.frameReportedLightVideoCount = 0
         t.frameReportedShadowVideoCount = 0
+        t.playerConfigObjectCount = 0
+        t.playerMediaDefinitionCount = 0
+        t.playerDefinitionQualities = ""
         t.frameVideoStates.clear()
         t.primaryFrameOrigin = ""
         t.primaryFrameId = ""
@@ -1509,8 +1565,14 @@ class MainActivity : AppCompatActivity() {
                             .put("url", url)
                             .put("label", m.optString("label").take(80))
                             .put("width", m.optInt("width", 0).coerceIn(0, 10000))
-                            .put("height", m.optInt("height", 0).coerceIn(0, 10000))
-                            .put("mime", m.optString("mime").take(120)))
+                        .put("height", m.optInt("height", 0).coerceIn(0, 10000))
+                        .put("mime", m.optString("mime").take(120))
+                        .put("captureSource", m.optString("captureSource").take(80))
+                        .put("codec", m.optString("codec").take(160))
+                        .put("frameRate", m.optDouble("frameRate", 0.0).coerceIn(0.0, 240.0))
+                        .put("dynamicRange", m.optString("dynamicRange").take(80))
+                        .put("bandwidth", m.optLong("bandwidth", 0L).coerceIn(0L, 1_000_000_000L))
+                        .put("representationId", m.optString("representationId").take(120)))
                     }
                 }
                 val src = item.optString("src").take(8192)
@@ -1536,6 +1598,13 @@ class MainActivity : AppCompatActivity() {
             t.frameVideoMessageCount++
             t.frameReportedLightVideoCount = maxOf(t.frameReportedLightVideoCount, incoming.optInt("lightVideoCount", 0).coerceIn(0, 12))
             t.frameReportedShadowVideoCount = maxOf(t.frameReportedShadowVideoCount, incoming.optInt("shadowVideoCount", 0).coerceIn(0, 12))
+            t.playerConfigObjectCount = maxOf(t.playerConfigObjectCount, incoming.optInt("playerConfigObjectCount", 0).coerceIn(0, 12))
+            t.playerMediaDefinitionCount = maxOf(t.playerMediaDefinitionCount, incoming.optInt("playerMediaDefinitionCount", 0).coerceIn(0, 64))
+            val incomingQualities = incoming.optJSONArray("playerDefinitionQualities")
+            if (incomingQualities != null) {
+                val q = (0 until minOf(incomingQualities.length(), 16)).map { incomingQualities.optString(it).take(12) }.filter { it.isNotBlank() }.distinct()
+                if (q.isNotEmpty()) t.playerDefinitionQualities = q.joinToString(", ")
+            }
             val stored = JSONObject().put("origin", sourceOrigin).put("frameId", frameId)
                 .put("isTop", incoming.optBoolean("isTop", false))
                 .put("at", now).put("videos", safeVideos).toString()
@@ -1556,9 +1625,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyFrameVideoStates(t: Tab) {
-        // A real top-frame VIDEO selected by SCAN_JS always wins over iframe fallback.
+        // If SCAN_JS already selected a top-frame VIDEO, keep its identity but use the
+        // native frame snapshot for playback/gesture state (especially for Blob/MSE players).
         val currentId = t.primaryVideoId
-        if (!currentId.isNullOrBlank() && !currentId.startsWith("frame-") && !currentId.startsWith("api-")) return
+        if (!currentId.isNullOrBlank() && !currentId.startsWith("frame-") && !currentId.startsWith("api-")) {
+            val expectedSrc = t.primaryCurrentSrc
+            if (expectedSrc.isNotBlank()) {
+                t.frameVideoStates.values.forEach { encoded ->
+                    try {
+                        val snapshot = JSONObject(encoded)
+                        if (!snapshot.optBoolean("isTop", false) ||
+                            !sameWebOrigin(t.url, snapshot.optString("origin")) ||
+                            System.currentTimeMillis() - snapshot.optLong("at", 0L) !in 0L..15_000L) return@forEach
+                        val videos = snapshot.optJSONArray("videos") ?: return@forEach
+                        val match = (0 until videos.length()).mapNotNull { videos.optJSONObject(it) }
+                            .firstOrNull { it.optString("src") == expectedSrc }
+                        if (match != null) {
+                            val playing = match.optBoolean("playing", false)
+                            val gesture = match.optBoolean("gesture", false)
+                            val ad = match.optBoolean("ad", false) || t.primaryIsAd
+                            val frameActive = FramePlaybackPolicy.shouldActivate(playing, gesture, ad, t.suspectedPreroll)
+                            t.framePlaybackActiveId = if (frameActive) currentId else null
+                            t.framePlaybackAt = System.currentTimeMillis()
+                            if (frameActive) {
+                                t.userGestureVideoIds.add(currentId)
+                                t.userGestureAt = t.framePlaybackAt
+                            }
+                            t.activePlayback = frameActive
+                            t.activeId = if (frameActive) currentId else null
+                            if (cur === t) updateFab()
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+            return
+        }
         val now = System.currentTimeMillis()
         data class Candidate(val origin: String, val frameId: String, val item: JSONObject)
         val candidates = ArrayList<Candidate>()
@@ -1643,10 +1744,18 @@ class MainActivity : AppCompatActivity() {
             }
             for (i in 0 until sources.length()) addPreparedSource(t, sources.optString(i), id, metaByUrl[sources.optString(i)])
         }
-        if (!isAd && !t.suspectedPreroll && item.optBoolean("playing", false) && item.optBoolean("gesture", false)) {
+        val framePlaying = item.optBoolean("playing", false)
+        val frameGesture = item.optBoolean("gesture", false)
+        if (!isAd && !t.suspectedPreroll && framePlaying && frameGesture) {
             t.userGestureVideoIds.add(id)
             t.userGestureAt = now
         }
+        // SCAN_JS cannot observe currentTime/gesture inside a cross-origin iframe.
+        // Use the authenticated native frame snapshot for the FAB state instead.
+        t.activePlayback = FramePlaybackPolicy.shouldActivate(framePlaying, frameGesture, isAd, t.suspectedPreroll)
+        t.framePlaybackActiveId = if (t.activePlayback) id else null
+        t.framePlaybackAt = now
+        t.activeId = if (t.activePlayback) id else null
         if ((t.primaryIsAd || t.suspectedPreroll) && !isAd) return
         syncMedia(t)
         if (cur === t) updateFab()
@@ -2010,6 +2119,8 @@ class MainActivity : AppCompatActivity() {
         t.lastResolveCandidateCount = 0
         t.activePlayback = false
         t.activeId = null
+        t.framePlaybackActiveId = null
+        t.framePlaybackAt = 0L
         t.userGestureVideoIds.clear()
         t.userGestureAt = 0L
         t.sawBlob = false
@@ -2459,6 +2570,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onScan(t: Tab, o: JSONObject) {
+        val now = System.currentTimeMillis()
         val p = o.optJSONObject("p")
         if (p == null) {
             // Some sites host the entire player in a cross-origin iframe, leaving no VIDEO
@@ -2546,9 +2658,19 @@ class MainActivity : AppCompatActivity() {
                     t.resolvingKey = ""
                 }
             }
-            t.activePlayback = false
-            t.activeId = null
-            // لا نمسح المصادر المحضّرة لمجرد أن العنصر خرج مؤقتًا من DOM/الرؤية.
+            val frameId = t.primaryVideoId
+            val frameStateFresh = frameId != null &&
+                t.framePlaybackActiveId == frameId && now - t.framePlaybackAt in 0L..5_000L &&
+                !t.primaryIsAd && !t.suspectedPreroll
+            if (!frameStateFresh) {
+                t.activePlayback = false
+                t.activeId = null
+                t.framePlaybackActiveId = null
+            } else {
+                t.activePlayback = true
+                t.activeId = frameId
+            }
+            // Keep an authenticated frame's recent playback state when the top document has no VIDEO.
             if (cur === t) updateFab()
             return
         }
@@ -2600,6 +2722,13 @@ class MainActivity : AppCompatActivity() {
         t.sawBlob = p.optBoolean("blob", src.startsWith("blob:", true))
         t.poster = p.optString("poster")
         val duration = p.optDouble("duration", 0.0)
+        t.playerConfigObjectCount = maxOf(t.playerConfigObjectCount, p.optInt("playerConfigObjectCount", 0).coerceIn(0, 12))
+        t.playerMediaDefinitionCount = maxOf(t.playerMediaDefinitionCount, p.optInt("playerMediaDefinitionCount", 0).coerceIn(0, 64))
+        val pageQualities = p.optJSONArray("playerDefinitionQualities")
+        if (pageQualities != null) {
+            val q = (0 until minOf(pageQualities.length(), 16)).map { pageQualities.optString(it).take(12) }.filter { it.isNotBlank() }.distinct()
+            if (q.isNotEmpty()) t.playerDefinitionQualities = q.joinToString(", ")
+        }
         // مدة عنصر الفيديو القصيرة وغير المصنفة قد تكون مدة إعلان؛ لا نعتمدها كمدة الفيلم.
         if (!nowAd && !suspectedPreroll && duration.isFinite() && duration > 12.0) {
             t.expectedDurationSec = duration
@@ -2626,8 +2755,16 @@ class MainActivity : AppCompatActivity() {
 
         val a = o.optJSONObject("a")
         val gestureMatches = id in t.userGestureVideoIds
-        t.activePlayback = a != null && a.optString("id") == id && gestureMatches &&
-            !t.primaryIsAd && !t.suspectedPreroll
+        val pagePlayback = a != null && a.optString("id") == id && gestureMatches
+        val framePlayback = FramePlaybackPolicy.shouldUseFrameFallback(
+            matchesVideo = t.framePlaybackActiveId == id,
+            fresh = System.currentTimeMillis() - t.framePlaybackAt in 0L..5_000L,
+            playing = t.framePlaybackActiveId == id,
+            userGesture = gestureMatches,
+            isAd = t.primaryIsAd,
+            suspectedPreroll = t.suspectedPreroll
+        )
+        t.activePlayback = (pagePlayback || framePlayback) && !t.primaryIsAd && !t.suspectedPreroll
         t.activeId = if (t.activePlayback) id else null
         syncMedia(t)
         if (cur === t) updateFab()
@@ -2672,6 +2809,10 @@ class MainActivity : AppCompatActivity() {
                 .append(" (إجمالي الرسائل ").append(t.frameVideoMessageCount).append(")\n")
             append("عناصر فيديو مرصودة: DOM=").append(t.frameReportedLightVideoCount)
                 .append(" / Shadow DOM=").append(t.frameReportedShadowVideoCount).append("\n")
+            append("إعدادات مشغل مرصودة: ").append(t.playerConfigObjectCount)
+                .append(" / mediaDefinitions: ").append(t.playerMediaDefinitionCount)
+            if (t.playerDefinitionQualities.isNotBlank()) append(" / الجودات: ").append(t.playerDefinitionQualities)
+            append("\n")
             append("جسر WebMessage Listener: ").append(if (t.frameBridgeRegistered) "مسجل" else "لم يسجل")
             if (t.frameBridgeError.isNotBlank()) append(" — ").append(t.frameBridgeError)
             append("\n")

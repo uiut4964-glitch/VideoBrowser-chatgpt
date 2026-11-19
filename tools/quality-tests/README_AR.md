@@ -1,4 +1,4 @@
-# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.2 / Stage 3.2 – iframe detection fix
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.3 / Stage 3.3 – Blob/MSE renditions and frame playback
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 

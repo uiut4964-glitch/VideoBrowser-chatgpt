@@ -271,8 +271,10 @@ internal const val EARLY_API_CAPTURE_JS = """
       var frameVideoLast = Object.create(null);
       var pointerState = { x: -1, y: -1, at: 0 };
       var frameAdPattern = /(?:doubleclick|googlesyndication|googleadservices|imasdk|vasttag|adservice|adserver|preroll|midroll|postroll)/i;
+      var frameAdDefinitionPattern = /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i;
       var observedRoots = [];
       var scanScheduled = false;
+      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [] };
 
       function sendFrameProbe(phase, lightCount, shadowCount, rootCount) {
         try {
@@ -358,6 +360,40 @@ internal const val EARLY_API_CAPTURE_JS = """
             });
           }
         } catch (_) {}
+        // Read only explicit mediaDefinitions from named flashvars objects. This supports
+        // MSE players whose VIDEO.currentSrc is blob: but whose player config lists HLS/MP4 renditions.
+        try {
+          var names = Object.keys(window).filter(function(name){ return /^flashvars(?:_\d+)?$/i.test(name); }).slice(0, 12);
+          frameFlashvarsStats.objects = Math.max(frameFlashvarsStats.objects, names.length);
+          for (var fi = 0; fi < names.length; fi++) {
+            var config = window[names[fi]];
+            var definitions = config && config.mediaDefinitions;
+            if (!Array.isArray(definitions)) continue;
+            frameFlashvarsStats.definitions = Math.max(frameFlashvarsStats.definitions, definitions.length);
+            for (var di = 0; di < Math.min(definitions.length, 64); di++) {
+              var def = definitions[di];
+              if (!def || typeof def !== 'object') continue;
+              var mediaUrl = def.videoUrl || def.video_url || def.url || '';
+              if (!mediaUrl) continue;
+              var format = String(def.format || def.type || '').toLowerCase();
+              var q = Array.isArray(def.quality) ? 0 : Number(String(def.quality || '').match(/\d{3,4}/)?.[0] || 0);
+              var defRole = String(def.role || '').toLowerCase();
+              if (def.isAd === true || def.ad === true || defRole === 'ad' || defRole === 'advertisement' ||
+                  frameAdPattern.test(mediaUrl) || frameAdDefinitionPattern.test(mediaUrl)) continue;
+              if (q > 0 && frameFlashvarsStats.qualities.indexOf(q + 'p') < 0 && frameFlashvarsStats.qualities.length < 16) {
+                frameFlashvarsStats.qualities.push(q + 'p');
+              }
+              add(mediaUrl, {
+                label: q > 0 ? q + 'p' : '', height: q > 0 ? q : 0,
+                mime: /^(hls|m3u8|mpegurl)$/.test(format) ? 'application/vnd.apple.mpegurl' :
+                  (/^(mp4|webm|quicktime)$/.test(format) ? 'video/' + format : ''),
+                codec: def.codecs || def.codec || '', frameRate: Number(def.frameRate || def.fps || 0),
+                bandwidth: Number(def.bandwidth || def.bitrate || 0),
+                representationId: def.id || def.formatId || '', captureSource: 'player-flashvars'
+              });
+            }
+          }
+        } catch (_) {}
         return result;
       }
 
@@ -412,6 +448,7 @@ internal const val EARLY_API_CAPTURE_JS = """
 
       function sendFrameVideoState() {
         try {
+          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [] };
           var bridge = window.VideoBrowserCapture;
           if (!bridge || typeof bridge.postMessage !== 'function') return;
           var found = collectFrameVideos();
@@ -444,11 +481,16 @@ internal const val EARLY_API_CAPTURE_JS = """
             var rect = video.getBoundingClientRect();
             var playing = !video.paused && !video.ended;
             var inBounds = frameVisible(video);
-            var gesture = Date.now() - pointerState.at <= 12000 && pointerState.x >= rect.left && pointerState.x <= rect.right &&
+            var pointerHit = Date.now() - pointerState.at <= 12000 && pointerState.x >= rect.left && pointerState.x <= rect.right &&
               pointerState.y >= rect.top && pointerState.y <= rect.bottom;
+            if (pointerHit) video.__vbFrameUserInitiated = true;
+            var gesture = video.__vbFrameUserInitiated === true;
             var currentAd = frameAd(video, src);
             var meta = sources.map(function(item){ return { url:item.url, label:item.meta.label || '',
-              width:Number(item.meta.width || 0), height:Number(item.meta.height || 0), mime:item.meta.mime || '' }; });
+              width:Number(item.meta.width || 0), height:Number(item.meta.height || 0), mime:item.meta.mime || '',
+              captureSource:item.meta.captureSource || '', codec:item.meta.codec || '',
+              frameRate:Number(item.meta.frameRate || 0), dynamicRange:item.meta.dynamicRange || '',
+              bandwidth:Number(item.meta.bandwidth || 0), representationId:item.meta.representationId || '' }; });
             videos.push({
               id: video.__vbFrameVideoId, src: src, sources: sources.map(function(item){ return item.url; }),
               sourceMeta: meta, poster: String(video.poster || ''),
@@ -470,6 +512,9 @@ internal const val EARLY_API_CAPTURE_JS = """
             kind: 'frame-video-state', frameId: frameId, frameOrigin: String(location.origin || ''),
             isTop: frameIsTop, shadowRootCount: found.shadowRoots,
             lightVideoCount: lightVideoCount, shadowVideoCount: shadowVideoCount,
+            playerConfigObjectCount: frameFlashvarsStats.objects,
+            playerMediaDefinitionCount: frameFlashvarsStats.definitions,
+            playerDefinitionQualities: frameFlashvarsStats.qualities,
             at: Date.now(), videos: videos
           }));
           sendFrameProbe('scan-video-found', lightVideoCount, shadowVideoCount, found.shadowRoots);
@@ -480,6 +525,16 @@ internal const val EARLY_API_CAPTURE_JS = """
         try {
           var p = event.touches && event.touches.length ? event.touches[0] : event;
           pointerState = { x: Number(p.clientX || -1), y: Number(p.clientY || -1), at: Date.now() };
+          var nodes = collectFrameVideos().videos;
+          for (var vi = 0; vi < nodes.length; vi++) {
+            var video = nodes[vi];
+            var rect = video.getBoundingClientRect();
+            if (pointerState.x >= rect.left && pointerState.x <= rect.right &&
+                pointerState.y >= rect.top && pointerState.y <= rect.bottom) {
+              video.__vbFrameUserInitiated = true;
+              video.__vbFrameUserInitiatedAt = Date.now();
+            }
+          }
           sendFrameVideoState();
         } catch (_) {}
       }
