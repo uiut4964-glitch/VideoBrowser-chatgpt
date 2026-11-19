@@ -830,9 +830,13 @@ private const val SCAN_JS = """
         (isAdUrl(currentSrc) ? 'ad-url' : (flashvarsExplicitAd ? 'player-ad-flag' : (durationMismatchAd ? 'player-duration-mismatch' : '')));
       v.__vbPlayerDuration = flashvarsVideoDuration;
       if (adNow) {
+        // The active <video> may be playing a preroll, but named player configuration
+        // still contains the actual movie renditions. Keep only those explicit rendition
+        // sources (flashvars / xHamster model); do not expose the ad currentSrc or old
+        // Resource-Timing manifests collected before the content transition.
         out = out.filter(function(u){
           var capture = sourceMeta[u] && sourceMeta[u].captureSource || '';
-          return capture !== 'player-flashvars' && capture !== 'player-xhamster' && capture !== 'performance-manifest';
+          return capture === 'player-flashvars' || capture === 'player-xhamster';
         });
       }
       var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });
@@ -1475,9 +1479,27 @@ class MainActivity : AppCompatActivity() {
         return root
     }
 
+    private fun hasPrerollPlayerRenditions(t: Tab): Boolean {
+        val id = t.primaryVideoId ?: return false
+        return t.media.values.any { item ->
+            item.videoId == id && item.sourceEpoch == t.primarySourceEpoch &&
+                item.origin == "dom-preroll" &&
+                item.captureSource in setOf("player-flashvars", "player-xhamster") &&
+                item.url != t.primaryCurrentSrc && !isLikelyAdUrl(item.url) && !isExcludedMediaUrl(item.url)
+        }
+    }
+
     private fun updateFab() {
-        // لا عدادات أو شارات: الأحمر حصريًا عند رصد تشغيل فعلي بدأه المستخدم.
-        val active = cur?.let { it.activePlayback && !it.primaryIsAd && !it.suspectedPreroll } == true
+        // No counters/badges. During a preroll the FAB can still turn red when the
+        // user started playback and the player has exposed explicit movie renditions.
+        val active = cur?.let { tab ->
+            val normalPlayback = tab.activePlayback && !tab.primaryIsAd && !tab.suspectedPreroll
+            val recentUserPlay = tab.primaryVideoId?.let { it in tab.userGestureVideoIds } == true &&
+                System.currentTimeMillis() - tab.userGestureAt in 0L..300_000L
+            val prerollCaptureReady = (tab.primaryIsAd || tab.suspectedPreroll) &&
+                recentUserPlay && hasPrerollPlayerRenditions(tab)
+            normalPlayback || prerollCaptureReady
+        } == true
         (fabIcon.background as GradientDrawable).setColor(
             if (active) 0xFFE53935.toInt() else 0xFF78909C.toInt()
         )
@@ -2069,6 +2091,7 @@ class MainActivity : AppCompatActivity() {
                     // لا نحذف التفاعل عند pause/ended؛ فقد يكون هذا انتقالًا من إعلان قصير إلى المحتوى.
                     tab.userGestureVideoIds.add(id)
                     tab.userGestureAt = System.currentTimeMillis()
+                    if (cur === tab) updateFab()
                     if (tab.userGestureVideoIds.size > 12) {
                         val keep = tab.userGestureVideoIds.toList().takeLast(8)
                         tab.userGestureVideoIds.clear()
@@ -2584,10 +2607,20 @@ class MainActivity : AppCompatActivity() {
 
         val videoId = t.primaryVideoId
         val epoch = t.primarySourceEpoch
-        val expectedDuration = t.expectedDurationSec
-        val currentSrc = t.primaryCurrentSrc
         val blockedAsAd = t.primaryIsAd || t.suspectedPreroll
-        val items = t.media.values.map { item ->
+        val expectedDuration = t.expectedDurationSec.takeIf { it > 12.0 }
+            ?: t.playerVideoDurationSec.takeIf { it > 12.0 }
+            ?: 0.0
+        val currentSrc = t.primaryCurrentSrc
+        val sourcePool = if (blockedAsAd) {
+            // Only explicit player-declared content renditions are eligible during an ad.
+            // Network captures and performance manifests are intentionally withheld.
+            t.media.values.filter { item ->
+                item.origin == "dom-preroll" &&
+                    item.captureSource in setOf("player-flashvars", "player-xhamster")
+            }
+        } else t.media.values.toList()
+        val items = sourcePool.map { item ->
             if (blockedAsAd && item.origin == "dom") {
                 MediaItem(item.url, item.type, "dom-preroll", item.videoId, item.sourceEpoch,
                     item.qualityHint, item.widthHint, item.heightHint, item.mimeHint,
@@ -2628,7 +2661,7 @@ class MainActivity : AppCompatActivity() {
                 if (t.resolvingKey == key) t.resolvingKey = ""
                 if (cur === t) {
                     updateFab()
-                    if (stillCurrent && t.pendingFormatSheet && !t.primaryIsAd && !t.suspectedPreroll) {
+                    if (stillCurrent && t.pendingFormatSheet) {
                         t.pendingFormatSheet = false
                         if (combinedFormats.isNotEmpty()) {
                             showFormatSheet(combinedFormats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
@@ -3235,15 +3268,21 @@ class MainActivity : AppCompatActivity() {
                     t.resolvedFormats = mergeFormatLists(t.resolvedFormats.orEmpty(), result.formats)
                     if (!t.primaryVideoId.isNullOrBlank()) t.resolvedKey = resolutionKey(t)
                 }
-                if (cur === t && t.pendingFormatSheet && !t.primaryIsAd && !t.suspectedPreroll) {
-                    t.pendingFormatSheet = false
+                if (cur === t && t.pendingFormatSheet) {
                     val formats = mergeFormatLists(t.resolvedFormats.orEmpty(), result.formats)
                     if (formats.isNotEmpty()) {
+                        t.pendingFormatSheet = false
                         showFormatSheet(formats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
                     } else if (t.media.isNotEmpty()) {
-                        // yt-dlp had no usable result; the existing WebView/manifest path remains available.
-                        scheduleBackgroundResolve(t)
+                        // Keep the pending UI request alive when a WebView resolver job is
+                        // already running; its completion will show any formats it finds.
+                        val currentKey = resolutionKey(t)
+                        if (t.resolvingKey != currentKey) {
+                            t.resolvedKey = "" // allow a fresh resolver pass after yt-dlp returned zero
+                            scheduleBackgroundResolve(t)
+                        }
                     } else {
+                        t.pendingFormatSheet = false
                         showDiscoveryDiagnostics(t, "لم ينتج yt-dlp خيار تنزيل صالحًا لهذه الصفحة. ${result.error}")
                     }
                 }
@@ -3253,19 +3292,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFabClick() {
         val t = cur ?: return
-        if (t.primaryIsAd || t.suspectedPreroll) {
-            showDiscoveryDiagnostics(t, "المشغل يعرض إعلانًا أو مصدرًا تمهيديًا؛ انتظر انتقاله إلى المحتوى ثم اضغط الزر مرة أخرى.")
-            return
-        }
-
         val pageUrl = pageExtractionKey(t.web.url ?: t.url)
+        val isPreroll = t.primaryIsAd || t.suspectedPreroll
+        val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val ytdlpFormats = if (t.ytdlpPageUrl == pageUrl) t.ytdlpFormats.orEmpty() else emptyList()
+
+        // Page-level yt-dlp results describe the requested video page, not the current
+        // ad element. YtDlpExtractor already rejects ad/preview/audio-only/DASH formats.
         if (ytdlpFormats.isNotEmpty()) {
-            val ready = mergeFormatLists(t.resolvedFormats.orEmpty(), ytdlpFormats)
-            if (ready.isNotEmpty()) {
-                showFormatSheet(ready, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
-                return
-            }
+            showFormatSheet(mergeFormatLists(t.resolvedFormats.orEmpty(), ytdlpFormats), headersFor(t), title, t.poster)
+            return
         }
 
         val videoId = t.primaryVideoId
@@ -3273,21 +3309,19 @@ class MainActivity : AppCompatActivity() {
             if (shouldUseYtDlpPageExtractor(pageUrl)) {
                 t.pendingFormatSheet = true
                 if (t.ytdlpLoadingUrl == pageUrl) {
-                    toast("يستخرج yt-dlp جودات الصفحة مباشرة؛ ستظهر القائمة عند اكتمال التحليل")
-                } else if (t.ytdlpAttemptedUrl != pageUrl || t.ytdlpFormats.isNullOrEmpty()) {
-                    // A failed/empty extraction may be transient (network, session or
-                    // short-lived site response); a user retry starts a fresh request.
-                    t.ytdlpAttemptedUrl = ""
-                    startYtDlpPreflight(t, pageUrl)
-                    toast("أعيد طلب استخراج الجودات من صفحة الموقع")
+                    toast("يستخرج yt-dlp جودات صفحة الفيديو؛ ستظهر القائمة عند اكتمال التحليل")
                 } else {
-                    showDiscoveryDiagnostics(t, "لم يعثر yt-dlp على صيغ فيديو قابلة للتنزيل. ${t.ytdlpReport}")
+                    // Empty/failed results are retryable. A page refresh must not permanently
+                    // cache a zero-format result for the lifetime of this WebView URL.
+                    t.ytdlpAttemptedUrl = ""
+                    t.resolvedKey = ""
+                    startYtDlpPreflight(t, pageUrl)
+                    toast("أعيد طلب استخراج جودات الفيديو من صفحة الموقع")
                 }
                 return
             }
             val message = when {
-                t.primaryIsAd -> "المشغل يعرض إعلانًا؛ لن نعرض روابطه الآن"
-                t.suspectedPreroll -> "المصدر الحالي قصير وغير معروف وقد يكون إعلانًا"
+                isPreroll -> "الإعلان يعمل، لكن إعدادات المشغل لم تكشف بعد صيغ المحتوى المسبقة"
                 t.sawBlob -> "مصدر الفيديو يستخدم Blob/MSE ولم تُكشف قائمة المحتوى بعد"
                 else -> "لم تُكتشف مصادر الفيديو الرئيسي بعد"
             }
@@ -3296,13 +3330,28 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Keep page-first yt-dlp results alongside the existing WebView/manifest resolver.
-        if (shouldUseYtDlpPageExtractor(pageUrl) && t.ytdlpAttemptedUrl != pageUrl && t.ytdlpLoadingUrl != pageUrl) {
-            startYtDlpPreflight(t, pageUrl)
+        if (isPreroll && !hasPrerollPlayerRenditions(t)) {
+            // Never offer the ad's currentSrc or raw ad/network requests. Ask yt-dlp for
+            // the page's content formats, or refresh the player scan if no page extractor applies.
+            if (shouldUseYtDlpPageExtractor(pageUrl)) {
+                t.pendingFormatSheet = true
+                if (t.ytdlpLoadingUrl == pageUrl) {
+                    toast("يجري استخراج صيغ محتوى الفيديو أثناء الإعلان")
+                } else {
+                    t.ytdlpAttemptedUrl = ""
+                    t.resolvedKey = ""
+                    startYtDlpPreflight(t, pageUrl)
+                    toast("يبحث عن جودات الفيديو الأصلية أثناء الإعلان")
+                }
+            } else {
+                scan(t)
+                showDiscoveryDiagnostics(t, "لم تظهر صيغ المحتوى الأصلية بعد؛ تم تجاهل مصدر الإعلان. أعد الضغط بعد تحديث بيانات المشغل")
+            }
+            return
         }
+
         val key = resolutionKey(t)
         val headers = headersFor(t)
-        val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
         val cached = t.resolvedFormats
         if (t.resolvedKey == key && !cached.isNullOrEmpty()) {
@@ -3315,12 +3364,22 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (t.resolvedKey == key && cached.isNullOrEmpty()) {
-            showDiscoveryDiagnostics(t, "تم التقاط مصادر، لكن لم ينتج عنها أي خيار تنزيل صالح. ${t.ytdlpReport}")
-            return
+            // Negative cache is useful for background polling, but an explicit user tap
+            // is a request to retry fresh links and not to repeat the same diagnostic.
+            t.resolvedKey = ""
         }
+
+        // Retry yt-dlp when its previous page extraction returned zero formats, even if
+        // WebView/player sources exist. This is the important post-reload recovery path.
+        if (shouldUseYtDlpPageExtractor(pageUrl) && ytdlpFormats.isEmpty() &&
+            t.ytdlpLoadingUrl != pageUrl) {
+            t.ytdlpAttemptedUrl = ""
+            startYtDlpPreflight(t, pageUrl)
+        }
+
         t.pendingFormatSheet = true
         scheduleBackgroundResolve(t)
-        toast("بدأ تجهيز جودات الفيديو؛ ستظهر قائمة التحميل تلقائيًا عند اكتمالها")
+        toast(if (isPreroll) "يلتقط جودات المحتوى أثناء الإعلان؛ لن تُعرض روابط الإعلان" else "بدأ تجهيز جودات الفيديو؛ ستظهر قائمة التحميل تلقائيًا عند اكتمالها")
     }
 
     private fun qualityRank(label: String): Int =

@@ -28,7 +28,8 @@ function run(duration, declaredDuration) {
 
 const preroll = run(12, 420);
 if (!preroll.p || !preroll.p.ad) throw new Error('Player duration mismatch did not mark preroll as ad');
-if (preroll.p.sources.some(url => /(?:1080|720|480)\.m3u8/.test(url))) throw new Error('Renditions were exposed while preroll was active');
+for (const q of [1080,720,480]) if (!preroll.p.sources.some(url => url.includes(q + '.m3u8'))) throw new Error('Player-declared content rendition was not captured during preroll: ' + q);
+if (preroll.p.sources.some(url => /(?:ad|advert|preroll)/i.test(url))) throw new Error('An ad-marked rendition leaked during preroll');
 
 const content = run(420, 420);
 if (!content.p || content.p.ad) throw new Error('Normal content was incorrectly classified as ad');
@@ -36,4 +37,4 @@ for (const q of [1080,720,480]) if (!content.p.sources.some(url=>url.includes(q+
 
 const shortContent = run(9, 9);
 if (!shortContent.p || shortContent.p.ad) throw new Error('A genuinely short video matching the declared duration was incorrectly classified as ad');
-console.log('Preroll gate passed: duration mismatch hides renditions during ads, restores them for content, and preserves genuinely short videos');
+console.log('Preroll capture passed: player-declared content renditions remain available during ads, ad-marked sources stay excluded, and genuinely short videos remain valid');

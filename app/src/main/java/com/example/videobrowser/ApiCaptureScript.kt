@@ -636,9 +636,11 @@ internal const val EARLY_API_CAPTURE_JS = """
             var sources = frameMediaSources(video);
             var currentAd = frameAd(video, src);
             if (currentAd) {
-              // Do not expose player renditions while the same element is serving an ad.
+              // The active element is an ad, but its named player state can already
+              // expose the real content renditions. Keep only those explicit sources;
+              // withhold resource-timing manifests until after the ad/content boundary.
               sources = sources.filter(function(item){
-                return item.meta.captureSource !== 'player-flashvars' && item.meta.captureSource !== 'player-xhamster' && item.meta.captureSource !== 'performance-manifest';
+                return item.meta.captureSource === 'player-flashvars' || item.meta.captureSource === 'player-xhamster';
               });
             }
             var sourceKey = src + '||' + sources.map(function(item){ return item.url; }).join('||');

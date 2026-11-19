@@ -1,4 +1,3 @@
-
 (function(){
   try {
     var isHttp = function(u){ return /^https?:\/\//i.test(String(u || '')); };
@@ -752,9 +751,13 @@
         (isAdUrl(currentSrc) ? 'ad-url' : (flashvarsExplicitAd ? 'player-ad-flag' : (durationMismatchAd ? 'player-duration-mismatch' : '')));
       v.__vbPlayerDuration = flashvarsVideoDuration;
       if (adNow) {
+        // The active <video> may be playing a preroll, but named player configuration
+        // still contains the actual movie renditions. Keep only those explicit rendition
+        // sources (flashvars / xHamster model); do not expose the ad currentSrc or old
+        // Resource-Timing manifests collected before the content transition.
         out = out.filter(function(u){
           var capture = sourceMeta[u] && sourceMeta[u].captureSource || '';
-          return capture !== 'player-flashvars' && capture !== 'player-xhamster' && capture !== 'performance-manifest';
+          return capture === 'player-flashvars' || capture === 'player-xhamster';
         });
       }
       var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });

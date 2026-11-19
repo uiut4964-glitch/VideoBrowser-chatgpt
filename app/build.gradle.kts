@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.videobrowser"
         minSdk = 29
         targetSdk = 34
-        versionCode = 21
-        versionName = "1.11.7"
+        versionCode = 22
+        versionName = "1.11.8"
 
         // The current test device is arm64. The yt-dlp Android runtime ships
         // Python/QuickJS native libraries, so restrict this test APK to ARM64.

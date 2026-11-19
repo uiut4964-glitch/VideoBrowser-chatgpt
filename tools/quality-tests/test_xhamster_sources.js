@@ -37,8 +37,9 @@ if(result.p.sources.some(value=>value.includes('xh-download.mp4'))) throw new Er
 if(result.p.xhamsterOpaqueCount<1) throw new Error('Opaque value was not counted without decoding');
 video.duration=12;
 const preroll=run(window,document,{href:document.baseURI},()=>({display:'block',visibility:'visible',opacity:'1'}));
-if(!preroll.p.ad || preroll.p.sources.some(value=>value.includes('xh-main-'))) throw new Error('xHamster content renditions leaked while duration-mismatch preroll was active');
+if(!preroll.p.ad || !preroll.p.sources.some(value=>value.includes('xh-main-720.mp4'))) throw new Error('xHamster player-declared content rendition was not captured during duration-mismatch preroll');
+if(preroll.p.sources.some(value=>value.includes('xh-download.mp4'))) throw new Error('xHamster download endpoint leaked during preroll');
 video.duration=600;
 const afterAd=run(window,document,{href:document.baseURI},()=>({display:'block',visibility:'visible',opacity:'1'}));
 if(afterAd.p.ad || !afterAd.p.sources.some(value=>value.includes('xh-main-2160'))) throw new Error('xHamster content renditions were not restored after ad transition');
-console.log('Main-frame xHamster extraction passed: clear MP4/HLS renditions and quality metadata captured; download/opaque values handled safely; preroll gated');
+console.log('Main-frame xHamster extraction passed: clear MP4/HLS renditions captured before ad completion; download/opaque values handled safely; ad transition remains classified');

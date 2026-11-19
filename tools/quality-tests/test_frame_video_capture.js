@@ -126,14 +126,17 @@ if (selected.sources.some(url => url.includes('xh-download-link'))) throw new Er
 if (JSON.stringify(state).includes('session=must-not-copy')) throw new Error('Frame document query leaked into snapshot');
 if (typeof window.__interval !== 'function') throw new Error('Frame state polling was not installed');
 
-// A short in-player preroll is recognized against the content duration declared by flashvars.
+// A short in-player preroll is recognized, but explicit player-declared content renditions remain available.
+// Previously observed Resource-Timing manifests stay withheld until the content transition.
 video.duration = 12;
 video.currentTime = 4;
 window.__interval();
 const adState = nativeMessages.filter(item => item.kind === 'frame-video-state').slice(-1)[0];
 if (!adState.videos[0].ad || adState.videos[0].adReason !== 'player-duration-mismatch') throw new Error('Preroll duration mismatch was not classified as an ad');
 if (adState.videos[0].playerVideoDuration !== 420) throw new Error('Content duration missing during preroll diagnostic');
-if (adState.videos[0].sources.some(url => url.includes('content-1080') || url.includes('active-from-player') || url.includes('xh-720') || url.includes('xh-2160'))) throw new Error('Content renditions leaked while an ad was playing');
+if (!adState.videos[0].sources.some(url => url.includes('content-1080'))) throw new Error('Player-declared flashvars rendition was not captured during preroll');
+if (!adState.videos[0].sources.some(url => url.includes('xh-720')) || !adState.videos[0].sources.some(url => url.includes('xh-2160'))) throw new Error('Player-declared xHamster renditions were not captured during preroll');
+if (adState.videos[0].sources.some(url => url.includes('active-from-player') || url.includes('fresh-content-after-transition'))) throw new Error('Resource-Timing manifest was admitted during preroll');
 
 // When the same player transitions to its declared content duration, old preroll manifests stay hidden,
 // while a genuinely fresh manifest requested after the transition can be admitted.
