@@ -3136,7 +3136,7 @@ class MainActivity : AppCompatActivity() {
             append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" }).append("\n")
             append("قوائم HLS/DASH المرصودة من تحميل المشغل: ").append(t.preparedMedia.values.count { it.captureSource == "performance-manifest" }).append("\n")
             append("روابط موقعة منتهية حسب validto/expires: ").append(t.preparedMedia.keys.count { MediaUrlExpiry.isExpired(it) }).append("\n")
-            append("محرك yt-dlp: ").append(YtDlpExtractor.status(this)).append("\n")
+            append("محرك yt-dlp: ").append(YtDlpExtractor.status(this@MainActivity)).append("\n")
             append("استخراج صفحة الموقع: ").append(t.ytdlpReport).append("\n")
             if (t.lastResolveReport.isNotBlank()) append("\nتقرير تحليل WebView/Manifest:\n").append(t.lastResolveReport)
             append("\n\nالتشخيص لا يعرض Cookies أو Authorization أو قيم الروابط الموقعة.")

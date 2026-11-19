@@ -51,9 +51,13 @@ assert.match(app, /YtDlpExtractor\.warmUp\(this\)/,
 assert.match(settings, /YtDlpExtractor\.update\(this\)/,
   'The user must be able to update the actual yt-dlp executable from settings.');
 
-assert.match(downloads, /private fun requestHeaders\(t: Task, targetUrl: String\)/,
-  'Downloads must obtain session cookies at request time.');
+assert.match(downloads, /internal fun requestHeaders\(t: Task, targetUrl: String\)/,
+  'The request-header helper must be visible to the separate Engine object.');
+assert.match(downloads, /DownloadCenter\.requestHeaders\(t, t\.url\)/,
+  'The Engine must call the request-header helper through DownloadCenter.');
 assert.match(downloads, /CookieManager\.getInstance\(\)\.getCookie\(targetUrl\)/);
+assert.match(main, /YtDlpExtractor\.status\(this@MainActivity\)/,
+  'The diagnostics builder must pass the Activity context, not its StringBuilder receiver.');
 assert.match(downloads, /\.put\("headers", JSONObject\(t\.headers\)\)/,
   'Only the safe, persistent header set is stored with download tasks.');
 assert.match(notices, /GNU GPL v3\.0/,

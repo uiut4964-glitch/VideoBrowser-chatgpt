@@ -2,6 +2,10 @@
 
 هذه حزمة مصدر مبنية على مشروع VideoBrowser `v1.11.6-stage3.6` المحفوظ، مع دمج المكتبة الفعلية `io.github.junkfood02.youtubedl-android:library:0.18.1` من Maven Central. ليست محاكاة ولا مستخرجًا محليًا بديلًا عن yt-dlp.
 
+## إصلاح أخطاء البناء السابقة
+
+تتضمن هذه النسخة إصلاح خطأ صلاحية `requestHeaders` بين `DownloadCenter` و`Engine`، وإصلاح تمرير سياق `MainActivity` داخل تشخيص yt-dlp. التفاصيل في `BUILD_FIX_NOTES_AR.md`. لم يُنفذ Android `assembleDebug` بعد هذا التصحيح؛ أعد تشغيل workflow للتحقق من بناء APK.
+
 ## ما الذي تغيّر؟
 
 - تهيئة محرك Python/QuickJS وyt-dlp من المكتبة الرسمية داخل التطبيق.
