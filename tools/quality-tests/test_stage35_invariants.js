@@ -18,6 +18,14 @@ if (/val ad = match\.optBoolean\("ad", false\) \|\| t\.primaryIsAd/.test(main)) 
   throw new Error('A stale ad flag can keep the content classified as an ad after transition');
 }
 must(api, /captureSource:\s*'performance-manifest'/, 'Iframe Resource Timing manifest capture is missing');
-must(scan, /capture !== 'player-flashvars' && capture !== 'performance-manifest'/, 'Main-frame player manifests/renditions are not withheld during preroll');
-must(api, /item\.meta\.captureSource !== 'player-flashvars' && item\.meta\.captureSource !== 'performance-manifest'/, 'Iframe player manifests/renditions are not withheld during preroll');
+must(scan, /capture !== 'player-flashvars' && capture !== 'player-xhamster' && capture !== 'performance-manifest'/, 'Main-frame player manifests/renditions are not withheld during preroll');
+must(api, /item\.meta\.captureSource !== 'player-flashvars' && item\.meta\.captureSource !== 'player-xhamster' && item\.meta\.captureSource !== 'performance-manifest'/, 'Iframe player manifests/renditions are not withheld during preroll');
 console.log('Stage 3.5 invariants passed: ad gate, grey FAB during preroll, per-page state reset, frame ad diagnostics, fresh-manifest priority, non-sticky ad transition, and manifest preroll filtering');
+
+must(scan, /player-xhamster/, 'Main-frame xHamster source extraction is missing');
+must(api, /xhModelSources|videoModel/, 'Iframe xHamster initials extraction is missing');
+must(api, /frameContentTransitionAt > 0 && entryAt < frameContentTransitionAt - 1200/, 'Iframe Resource Timing does not discard stale preroll manifests');
+must(main, /filterDetails|تفاصيل صيغ استبعدها فلتر المحتوى/, 'Duration-filter rejection diagnostics are missing');
+must(scan, /capture !== 'player-xhamster'/, 'Main-frame xHamster sources are not withheld during preroll');
+must(api, /item\.meta\.captureSource !== 'player-xhamster'/, 'Iframe xHamster sources are not withheld during preroll');
+console.log('Stage 3.6 invariants passed: xHamster page/frame extraction, opaque-value safety, ad gating, stale-manifest filtering, and duration rejection diagnostics');

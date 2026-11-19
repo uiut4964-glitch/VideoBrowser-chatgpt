@@ -274,7 +274,8 @@ internal const val EARLY_API_CAPTURE_JS = """
       var frameAdDefinitionPattern = /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i;
       var observedRoots = [];
       var scanScheduled = false;
-      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false };
+      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false,
+        xhamsterStateFound: false, xhamsterSourceCount: 0, xhamsterQualities: [], xhamsterOpaqueCount: 0, xhamsterSeen: Object.create(null) };
 
       function sendFrameProbe(phase, lightCount, shadowCount, rootCount) {
         try {
@@ -409,6 +410,130 @@ internal const val EARLY_API_CAPTURE_JS = """
             }
           }
         } catch (_) {}
+        // xHamster keeps exposed source maps in initials.videoModel.sources and
+        // xplayerSettings.sources. Read only these named structures and plain HTTP(S) URLs.
+        // Encoded/opaque values are counted for diagnostics but are never decoded.
+        try {
+          var xhInitials = window.initials;
+          if (!xhInitials && typeof initials !== 'undefined') xhInitials = initials;
+          if (xhInitials && typeof xhInitials === 'object') {
+            var xhModel = xhInitials.videoModel && typeof xhInitials.videoModel === 'object' ? xhInitials.videoModel : null;
+            var xhDuration = Number(xhModel && (xhModel.duration || xhModel.videoDuration || xhModel.video_duration) || xhInitials.videoDuration || 0);
+            if (Number.isFinite(xhDuration) && xhDuration > 20 && xhDuration < 86400 && xhDuration > frameFlashvarsStats.videoDuration) {
+              frameFlashvarsStats.videoDuration = xhDuration;
+            }
+            var xhModelSources = xhModel && xhModel.sources && typeof xhModel.sources === 'object' ? xhModel.sources : null;
+            var xhSettingsSources = xhInitials.xplayerSettings && xhInitials.xplayerSettings.sources &&
+              typeof xhInitials.xplayerSettings.sources === 'object' ? xhInitials.xplayerSettings.sources : null;
+            frameFlashvarsStats.xhamsterStateFound = !!(xhModelSources || xhSettingsSources);
+            var xhVisited = [];
+            var xhNodes = 0;
+            var xhDirectKeys = ['url','videoUrl','video_url','src','file','link','playbackUrl','playback_url',
+              'fallback','manifest','playlist','streamUrl','stream_url','hlsUrl','hls_url'];
+            function xhAddFrameUrl(raw, formatName, qualityHint, item) {
+              var value = String(raw || '').trim();
+              if (!value) return;
+              if (!/^https?:\/\//i.test(value)) {
+                if (/^[a-f0-9]{24,}$/i.test(value) && !frameFlashvarsStats.xhamsterSeen[value]) {
+                  frameFlashvarsStats.xhamsterSeen[value] = true;
+                  frameFlashvarsStats.xhamsterOpaqueCount++;
+                }
+                return;
+              }
+              var normalized = '';
+              try { normalized = new URL(value, document.baseURI).href; } catch (_) { return; }
+              if (!/^https?:/i.test(normalized) || frameAdPattern.test(normalized) || isPreviewFrameUrl(normalized)) return;
+              var meta = {};
+              if (item && typeof item === 'object') {
+                var w = Number(item.width || item.videoWidth || item.w || 0);
+                var h = Number(item.height || item.videoHeight || item.video_height || item.h || 0);
+                if ((!w || !h) && typeof item.resolution === 'string') {
+                  var dm = /(\d{3,5})\s*[x×]\s*(\d{3,5})/i.exec(item.resolution);
+                  if (dm) { w = w || Number(dm[1]); h = h || Number(dm[2]); }
+                }
+                if (w > 0) meta.width = w;
+                if (h > 0) meta.height = h;
+                if (item.codec || item.codecs) meta.codec = String(item.codec || item.codecs).slice(0, 160);
+                if (item.frameRate || item.fps) meta.frameRate = Number(item.frameRate || item.fps) || 0;
+                if (item.bandwidth || item.bitrate) meta.bandwidth = Number(item.bandwidth || item.bitrate) || 0;
+                if (item.id || item.formatId) meta.representationId = String(item.id || item.formatId).slice(0, 100);
+                if (item.dynamicRange || item.videoRange || item.hdr) meta.dynamicRange = String(item.dynamicRange || item.videoRange || item.hdr).slice(0, 80);
+              }
+              var qText = [qualityHint || '', item && item.quality || '', item && item.qualityLabel || '', item && item.resolution || ''].join(' ');
+              var dims = /(\d{3,5})\s*[x×]\s*(\d{3,5})/i.exec(qText);
+              var qm = /(?:^|[^0-9])(\d{3,4})\s*p?(?:$|[^0-9])/i.exec(qText);
+              var q = Number(meta.height || (dims ? dims[2] : 0) || (qm ? qm[1] : 0) || 0);
+              var label = q > 0 ? q + 'p' : (/\b(?:2k|qhd|4k|uhd)\b/i.test(qText) ? (qText.match(/\b(?:2k|qhd|4k|uhd)\b/i) || [''])[0].toUpperCase() : '');
+              if (q > 0) meta.height = q;
+              if (label) meta.label = label;
+              var fmt = String(formatName || '').toLowerCase();
+              if (/hls|m3u8/.test(fmt)) meta.mime = 'application/vnd.apple.mpegurl';
+              else if (/mp4|h264|avc|av1|standard/.test(fmt)) meta.mime = meta.mime || 'video/mp4';
+              if (/h264|avc/.test(fmt)) meta.codec = meta.codec || 'H.264';
+              else if (/av1/.test(fmt)) meta.codec = meta.codec || 'AV1';
+              meta.captureSource = 'player-xhamster';
+              if (label && frameFlashvarsStats.xhamsterQualities.indexOf(label) < 0 && frameFlashvarsStats.xhamsterQualities.length < 24) {
+                frameFlashvarsStats.xhamsterQualities.push(label);
+              }
+              if (frameFlashvarsStats.xhamsterSeen[normalized]) return;
+              frameFlashvarsStats.xhamsterSeen[normalized] = true;
+              add(normalized, meta);
+              if (result.some(function(entry){ return entry.url === normalized; })) frameFlashvarsStats.xhamsterSourceCount++;
+            }
+            function xhWalkFrame(node, formatName, qualityHint, depth) {
+              if (node == null || depth > 6 || xhNodes++ > 260) return;
+              if (typeof node === 'string') { xhAddFrameUrl(node, formatName, qualityHint, null); return; }
+              if (typeof node !== 'object' || xhVisited.indexOf(node) >= 0) return;
+              xhVisited.push(node);
+              if (Array.isArray(node)) {
+                for (var ai = 0; ai < Math.min(node.length, 48); ai++) xhWalkFrame(node[ai], formatName, qualityHint, depth + 1);
+                return;
+              }
+              var objectQuality = node.quality || node.qualityLabel || node.resolution || node.height || qualityHint || '';
+              for (var uk = 0; uk < xhDirectKeys.length; uk++) {
+                var direct = node[xhDirectKeys[uk]];
+                if (typeof direct === 'string') xhAddFrameUrl(direct, formatName, objectQuality, node);
+              }
+              var keys = Object.keys(node);
+              for (var ki = 0; ki < Math.min(keys.length, 64); ki++) {
+                var key = keys[ki];
+                if (xhDirectKeys.indexOf(key) >= 0 || /^(?:download|downloadUrl|download_url|ads?|advertisement|preview|thumbnail|thumb|poster|trailer|teaser|token|signature|cookie|authorization)$/i.test(key)) continue;
+                var child = node[key];
+                if (child == null || typeof child === 'boolean' || typeof child === 'number') continue;
+                var nextFormat = /^(?:hls|m3u8|mp4|webm|h264|avc|av1|standard)$/i.test(key) ? key : formatName;
+                var nextQuality = /(?:^|[^0-9])(?:\d{3,4}\s*p?|2k|qhd|4k|uhd)(?:$|[^a-z0-9])/i.test(key) ? key : objectQuality;
+                xhWalkFrame(child, nextFormat, nextQuality, depth + 1);
+              }
+            }
+            if (xhModelSources) {
+              var groupKeys = Object.keys(xhModelSources);
+              for (var gi = 0; gi < Math.min(groupKeys.length, 20); gi++) {
+                var groupName = groupKeys[gi];
+                if (/^(?:download|ads?|advertisement|preview|thumbnail|trailer)$/i.test(groupName)) continue;
+                xhWalkFrame(xhModelSources[groupName], groupName, '', 0);
+              }
+            }
+            if (xhSettingsSources) {
+              var settingsKeys = Object.keys(xhSettingsSources);
+              for (var si = 0; si < Math.min(settingsKeys.length, 20); si++) {
+                var settingsName = settingsKeys[si];
+                if (/download|ad|preview|trailer/i.test(settingsName) || !/(?:standard|h264|avc|av1|hls|mp4|source|quality)/i.test(settingsName)) continue;
+                xhWalkFrame(xhSettingsSources[settingsName], settingsName, '', 0);
+              }
+            }
+          }
+        } catch (_) {}
+        // Resource Timing contains old preroll manifests as well as content manifests.
+        // Remember the ad -> content boundary and ignore manifest entries older than it.
+        var frameAdNowForTiming = frameAd(video, video.currentSrc || video.getAttribute('src') || '');
+        if (frameAdNowForTiming) {
+          video.__vbFrameWasAd = true;
+          video.__vbFrameContentTransitionAt = 0;
+        } else if (video.__vbFrameWasAd === true) {
+          video.__vbFrameContentTransitionAt = Date.now();
+          video.__vbFrameWasAd = false;
+        }
+        var frameContentTransitionAt = Number(video.__vbFrameContentTransitionAt || 0);
         // Recover the active manifest used by a Blob/MSE player from Resource Timing.
         // Only manifest URLs are retained; segment URLs and response bodies are never read.
         try {
@@ -422,8 +547,10 @@ internal const val EARLY_API_CAPTURE_JS = """
             try { path = new URL(resourceUrl).pathname.toLowerCase(); } catch (_) {}
             if (!/\.(m3u8|mpd)$/.test(path) && !/(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/.test(path) &&
                 !/[?&](?:format|type|mime|contenttype)=[^&]*(?:m3u8|mpegurl|dash|mpd)/i.test(resourceUrl)) continue;
-            var age = now - (Number(performance.timeOrigin || 0) + Number(entry.startTime || 0));
+            var entryAt = Number(performance.timeOrigin || 0) + Number(entry.startTime || 0);
+            var age = now - entryAt;
             if (age < -5000 || age > 180000 || result.some(function(item){ return item.url === resourceUrl; })) continue;
+            if (frameContentTransitionAt > 0 && entryAt < frameContentTransitionAt - 1200) continue;
             result.push({url:resourceUrl, meta:{mime:/mpd/i.test(path) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'}});
             if (result.length >= 32) break;
           }
@@ -482,7 +609,8 @@ internal const val EARLY_API_CAPTURE_JS = """
 
       function sendFrameVideoState() {
         try {
-          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false };
+          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false,
+            xhamsterStateFound: false, xhamsterSourceCount: 0, xhamsterQualities: [], xhamsterOpaqueCount: 0, xhamsterSeen: Object.create(null) };
           var bridge = window.VideoBrowserCapture;
           if (!bridge || typeof bridge.postMessage !== 'function') return;
           var found = collectFrameVideos();
@@ -510,7 +638,7 @@ internal const val EARLY_API_CAPTURE_JS = """
             if (currentAd) {
               // Do not expose player renditions while the same element is serving an ad.
               sources = sources.filter(function(item){
-                return item.meta.captureSource !== 'player-flashvars' && item.meta.captureSource !== 'performance-manifest';
+                return item.meta.captureSource !== 'player-flashvars' && item.meta.captureSource !== 'player-xhamster' && item.meta.captureSource !== 'performance-manifest';
               });
             }
             var sourceKey = src + '||' + sources.map(function(item){ return item.url; }).join('||');
@@ -562,6 +690,10 @@ internal const val EARLY_API_CAPTURE_JS = """
             playerDefinitionQualities: frameFlashvarsStats.qualities,
             playerVideoDuration: frameFlashvarsStats.videoDuration,
             playerExplicitAd: frameFlashvarsStats.explicitAd,
+            xhamsterStateFound: frameFlashvarsStats.xhamsterStateFound,
+            xhamsterSourceCount: frameFlashvarsStats.xhamsterSourceCount,
+            xhamsterQualities: frameFlashvarsStats.xhamsterQualities,
+            xhamsterOpaqueCount: frameFlashvarsStats.xhamsterOpaqueCount,
             at: Date.now(), videos: videos
           }));
           sendFrameProbe('scan-video-found', lightVideoCount, shadowVideoCount, found.shadowRoots);

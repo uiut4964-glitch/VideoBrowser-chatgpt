@@ -286,6 +286,11 @@ private const val SCAN_JS = """
       var flashvarsQualities = [];
       var flashvarsVideoDuration = 0;
       var flashvarsExplicitAd = false;
+      var xhStateFound = false;
+      var xhSourceCount = 0;
+      var xhQualities = [];
+      var xhOpaqueCount = 0;
+      var xhSeen = Object.create(null);
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -432,11 +437,126 @@ private const val SCAN_JS = """
             add(definitionUrl, definitionMeta);
           }
         }
+        // xHamster exposes plain renditions in named page state containers on some pages.
+        // Read only these documented player subtrees and direct HTTP(S) URLs; never decode opaque values.
+        try {
+          var xhInitials = window.initials;
+          if (!xhInitials && typeof initials !== 'undefined') xhInitials = initials;
+          if (xhInitials && typeof xhInitials === 'object') {
+            var xhVideoModel = xhInitials.videoModel && typeof xhInitials.videoModel === 'object' ? xhInitials.videoModel : null;
+            var xhDuration = Number(xhVideoModel && (xhVideoModel.duration || xhVideoModel.videoDuration || xhVideoModel.video_duration) || xhInitials.videoDuration || 0);
+            if (Number.isFinite(xhDuration) && xhDuration > 20 && xhDuration < 86400 && xhDuration > flashvarsVideoDuration) flashvarsVideoDuration = xhDuration;
+            var xhSourceGroups = xhVideoModel && xhVideoModel.sources && typeof xhVideoModel.sources === 'object' ? xhVideoModel.sources : null;
+            var xhPlayerSources = xhInitials.xplayerSettings && xhInitials.xplayerSettings.sources &&
+              typeof xhInitials.xplayerSettings.sources === 'object' ? xhInitials.xplayerSettings.sources : null;
+            xhStateFound = !!(xhSourceGroups || xhPlayerSources);
+            var xhOpaqueSeen = Object.create(null);
+            var xhVisited = [];
+            var xhNodeCount = 0;
+            var xhDirectKeys = ['url','videoUrl','video_url','src','file','link','playbackUrl','playback_url',
+              'fallback','manifest','playlist','streamUrl','stream_url','hlsUrl','hls_url'];
+            var xhQualityFor = function(item, keyHint) {
+              var meta = mergeQualityMeta(item && typeof item === 'object' ? item : null, {}, String(keyHint || ''));
+              var text = [keyHint || '', meta.label || '', item && item.quality || '', item && item.resolution || ''].join(' ');
+              var dimensions = /(\d{3,5})\s*[x×]\s*(\d{3,5})/i.exec(text);
+              var numeric = /(?:^|[^0-9])(\d{3,4})\s*p?(?:$|[^0-9])/i.exec(text);
+              var explicitNumber = item && typeof item === 'object' ? Number(item.height || item.video_height || item.videoHeight || 0) : 0;
+              var height = Number(meta.height || (dimensions ? dimensions[2] : 0) || explicitNumber || (numeric ? numeric[1] : 0) || 0);
+              var namedQuality = /\b(?:2k|qhd|4k|uhd)\b/i.exec(text);
+              var label = namedQuality ? namedQuality[0].toUpperCase() :
+                (height >= 144 && height <= 4320 ? height + 'p' : (meta.label || ''));
+              return {meta:meta, height:height, label:label};
+            };
+            var xhAddUrl = function(raw, formatName, keyHint, item) {
+              var value = String(raw || '').trim();
+              if (!value) return;
+              if (!/^https?:\/\//i.test(value)) {
+                if (/^[a-f0-9]{24,}$/i.test(value) && !xhOpaqueSeen[value]) { xhOpaqueSeen[value] = true; xhOpaqueCount++; }
+                return;
+              }
+              var normalized = absUrl(value);
+              if (!isHttp(normalized) || isAdUrl(normalized) || isPreviewUrl(normalized)) return;
+              var q = xhQualityFor(item, keyHint);
+              var meta = q.meta;
+              if (q.height >= 144 && q.height <= 4320) meta.height = q.height;
+              if (q.label) meta.label = q.label;
+              var fmt = String(formatName || '').toLowerCase();
+              if (/hls|m3u8/.test(fmt)) meta.mime = 'application/vnd.apple.mpegurl';
+              else if (/mp4|h264|avc|av1|standard/.test(fmt)) meta.mime = meta.mime || 'video/mp4';
+              if (/h264|avc/.test(fmt)) meta.codec = meta.codec || 'H.264';
+              else if (/av1/.test(fmt)) meta.codec = meta.codec || 'AV1';
+              meta.captureSource = 'player-xhamster';
+              if (q.label && xhQualities.indexOf(q.label) < 0 && xhQualities.length < 24) xhQualities.push(q.label);
+              if (xhSeen[normalized]) return;
+              xhSeen[normalized] = true;
+              add(normalized, meta);
+              if (sourceMeta[normalized]) xhSourceCount++;
+            };
+            var xhWalk = function(node, formatName, keyHint, depth) {
+              if (node == null || depth > 6 || xhNodeCount++ > 260) return;
+              if (typeof node === 'string') { xhAddUrl(node, formatName, keyHint, null); return; }
+              if (typeof node !== 'object') return;
+              if (xhVisited.indexOf(node) >= 0) return;
+              xhVisited.push(node);
+              if (Array.isArray(node)) {
+                for (var ai = 0; ai < Math.min(node.length, 48); ai++) xhWalk(node[ai], formatName, keyHint, depth + 1);
+                return;
+              }
+              var objectQuality = node.quality || node.qualityLabel || node.resolution || node.height || keyHint || '';
+              var foundDirect = false;
+              for (var uk = 0; uk < xhDirectKeys.length; uk++) {
+                var directValue = node[xhDirectKeys[uk]];
+                if (typeof directValue === 'string') {
+                  xhAddUrl(directValue, formatName, objectQuality, node);
+                  foundDirect = true;
+                }
+              }
+              var keys = Object.keys(node);
+              for (var ki = 0; ki < Math.min(keys.length, 64); ki++) {
+                var childKey = keys[ki];
+                if (xhDirectKeys.indexOf(childKey) >= 0 || /^(?:download|downloadUrl|download_url|ads?|advertisement|preview|thumbnail|thumb|poster|trailer|teaser|token|signature|cookie|authorization)$/i.test(childKey)) continue;
+                var child = node[childKey];
+                if (child == null || typeof child === 'boolean' || typeof child === 'number') continue;
+                var nextFormat = /^(?:hls|m3u8|mp4|webm|h264|avc|av1|standard)$/i.test(childKey) ? childKey : formatName;
+                var nextQuality = /(?:^|[^0-9])(?:\d{3,4}\s*p?|2k|qhd|4k|uhd)(?:$|[^a-z0-9])/i.test(childKey) ? childKey : objectQuality;
+                xhWalk(child, nextFormat, nextQuality, depth + 1);
+              }
+              if (foundDirect) return;
+            };
+            if (xhSourceGroups) {
+              var xhFormatKeys = Object.keys(xhSourceGroups);
+              for (var xf = 0; xf < Math.min(xhFormatKeys.length, 20); xf++) {
+                var xhFormat = xhFormatKeys[xf];
+                if (/^(?:download|ads?|advertisement|preview|thumbnail|trailer)$/i.test(xhFormat)) continue;
+                xhWalk(xhSourceGroups[xhFormat], xhFormat, '', 0);
+              }
+            }
+            if (xhPlayerSources) {
+              var xhRootKeys = Object.keys(xhPlayerSources);
+              for (var xb = 0; xb < Math.min(xhRootKeys.length, 20); xb++) {
+                var xhBucketName = xhRootKeys[xb];
+                if (/download|ad|preview|trailer/i.test(xhBucketName)) continue;
+                if (!/(?:standard|h264|avc|av1|hls|mp4|source|quality)/i.test(xhBucketName)) continue;
+                xhWalk(xhPlayerSources[xhBucketName], xhBucketName, '', 0);
+              }
+            }
+          }
+        } catch (_) {}
         // Blob/MSE players may fetch the active HLS/DASH manifest without exposing it as currentSrc.
         // Read only recent manifest-like resource names; never inspect or copy media segment bodies.
         try {
           var perfEntries = performance && performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
           var perfNow = Date.now();
+          var perfCurrentSrc = absUrl(v.currentSrc || v.getAttribute('src') || '');
+          var perfDuration = Number(v.duration || 0);
+          var perfDurationMismatch = flashvarsVideoDuration > 20 && perfDuration > 0 &&
+            perfDuration < flashvarsVideoDuration - Math.max(15, flashvarsVideoDuration * 0.15) &&
+            perfDuration / flashvarsVideoDuration < 0.80;
+          var perfAdNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(perfCurrentSrc) || flashvarsExplicitAd || perfDurationMismatch;
+          if (perfAdNow) v.__vbContentTransitionAt = 0;
+          else if (v.__vbPerfWasAd === true) v.__vbContentTransitionAt = perfNow;
+          v.__vbPerfWasAd = !!perfAdNow;
+          var contentTransitionAt = Number(v.__vbContentTransitionAt || 0);
           for (var pe = Math.max(0, perfEntries.length - 320); pe < perfEntries.length; pe++) {
             var entry = perfEntries[pe];
             var resourceUrl = String(entry && entry.name || '');
@@ -446,8 +566,11 @@ private const val SCAN_JS = """
             var manifestLike = /\.(m3u8|mpd)(?:$)/i.test(resourcePath) || /(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/i.test(resourcePath) ||
               /[?&](?:format|type|mime|contenttype)=(?:[^&]*(?:m3u8|mpegurl|dash|mpd))/i.test(resourceUrl);
             if (!manifestLike) continue;
-            var age = perfNow - (Number(performance.timeOrigin || 0) + Number(entry.startTime || 0));
+            var entryAt = Number(performance.timeOrigin || 0) + Number(entry.startTime || 0);
+            var age = perfNow - entryAt;
             if (age < -5000 || age > 180000) continue;
+            // Ignore manifests loaded before the preroll-to-content transition, with a small race margin.
+            if (contentTransitionAt > 0 && entryAt < contentTransitionAt - 1500) continue;
             add(resourceUrl, {mime: /mpd/i.test(resourcePath) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'});
           }
         } catch (_) {}
@@ -709,7 +832,7 @@ private const val SCAN_JS = """
       if (adNow) {
         out = out.filter(function(u){
           var capture = sourceMeta[u] && sourceMeta[u].captureSource || '';
-          return capture !== 'player-flashvars' && capture !== 'performance-manifest';
+          return capture !== 'player-flashvars' && capture !== 'player-xhamster' && capture !== 'performance-manifest';
         });
       }
       var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });
@@ -722,6 +845,7 @@ private const val SCAN_JS = """
         add(v.currentSrc, {width:Number(v.videoWidth || 0), height:Number(v.videoHeight || 0), mime:'video/mp4'});
       }
       v.__vbFlashvarsStats = { objects:flashvarsObjectCount, definitions:flashvarsDefinitionCount, qualities:flashvarsQualities.slice(0, 16) };
+      v.__vbXhamsterStats = { stateFound:!!xhStateFound, sourceCount:xhSourceCount, qualities:xhQualities.slice(0, 24), opaqueCount:xhOpaqueCount };
       v.__vbSourceMeta = out.slice(0, 128).map(function(u){
         var m = sourceMeta[u] || {};
         return {url:u, label:m.label || '', width:Number(m.width || 0), height:Number(m.height || 0), mime:m.mime || '',
@@ -738,7 +862,7 @@ private const val SCAN_JS = """
     var emit = function(v, eventName){
       try {
         var id = makeId(v);
-        if (eventName === 'loadstart' || eventName === 'emptied') v.__vbContentTransition = false;
+        if (eventName === 'loadstart' || eventName === 'emptied') { v.__vbContentTransition = false; v.__vbPerfWasAd = false; v.__vbContentTransitionAt = 0; }
         var src = absUrl(v.currentSrc || v.getAttribute('src') || '');
         var sources = collectSources(v);
         var key = src + '||' + sources.join('||');
@@ -928,6 +1052,10 @@ private const val SCAN_JS = """
         playerConfigObjectCount: Number((pv.__vbFlashvarsStats || {}).objects || 0),
         playerMediaDefinitionCount: Number((pv.__vbFlashvarsStats || {}).definitions || 0),
         playerDefinitionQualities: (pv.__vbFlashvarsStats || {}).qualities || [],
+        xhamsterStateFound: !!(pv.__vbXhamsterStats || {}).stateFound,
+        xhamsterSourceCount: Number((pv.__vbXhamsterStats || {}).sourceCount || 0),
+        xhamsterQualities: (pv.__vbXhamsterStats || {}).qualities || [],
+        xhamsterOpaqueCount: Number((pv.__vbXhamsterStats || {}).opaqueCount || 0),
         playerVideoDuration: Number(pv.__vbPlayerDuration || 0),
         adReason: String(pv.__vbAdReason || ''),
         suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
@@ -983,6 +1111,10 @@ class MainActivity : AppCompatActivity() {
         var playerDefinitionQualities = ""
         var playerVideoDurationSec = 0.0
         var playerAdReason = ""
+        var xhamsterStateFound = false
+        var xhamsterSourceCount = 0
+        var xhamsterQualities = ""
+        var xhamsterOpaqueCount = 0
         // Cross-origin/frame player snapshots, held only in memory for the active page.
         val frameVideoStates = LinkedHashMap<String, String>()
         var primaryFrameOrigin = ""
@@ -1008,6 +1140,7 @@ class MainActivity : AppCompatActivity() {
         @Volatile var resolvedFormats: List<Format>? = null
         @Volatile var resolvedKey = ""
         @Volatile var resolvingKey = ""
+        @Volatile var pendingFormatSheet = false
         @Volatile var lastResolveReport = "لم يبدأ تحليل المصادر بعد"
         @Volatile var lastResolveCandidateCount = 0
         @Volatile var activeId: String? = null
@@ -1652,6 +1785,14 @@ class MainActivity : AppCompatActivity() {
                 val q = (0 until minOf(incomingQualities.length(), 16)).map { incomingQualities.optString(it).take(12) }.filter { it.isNotBlank() }.distinct()
                 if (q.isNotEmpty()) t.playerDefinitionQualities = q.joinToString(", ")
             }
+            t.xhamsterStateFound = t.xhamsterStateFound || incoming.optBoolean("xhamsterStateFound", false)
+            t.xhamsterSourceCount = maxOf(t.xhamsterSourceCount, incoming.optInt("xhamsterSourceCount", 0).coerceIn(0, 64))
+            t.xhamsterOpaqueCount = maxOf(t.xhamsterOpaqueCount, incoming.optInt("xhamsterOpaqueCount", 0).coerceIn(0, 128))
+            val frameXhQualities = incoming.optJSONArray("xhamsterQualities")
+            if (frameXhQualities != null) {
+                val values = (0 until minOf(frameXhQualities.length(), 24)).map { frameXhQualities.optString(it).take(16) }.filter { it.isNotBlank() }.distinct()
+                if (values.isNotEmpty()) t.xhamsterQualities = values.joinToString(", ")
+            }
             val stored = JSONObject().put("origin", sourceOrigin).put("frameId", frameId)
                 .put("isTop", incoming.optBoolean("isTop", false))
                 .put("at", now).put("videos", safeVideos).toString()
@@ -2160,6 +2301,11 @@ class MainActivity : AppCompatActivity() {
         t.playerDefinitionQualities = ""
         t.playerVideoDurationSec = 0.0
         t.playerAdReason = ""
+        t.xhamsterStateFound = false
+        t.xhamsterSourceCount = 0
+        t.xhamsterQualities = ""
+        t.xhamsterOpaqueCount = 0
+        t.pendingFormatSheet = false
         t.frameVideoStates.clear()
         t.primaryFrameOrigin = ""
         t.primaryFrameId = ""
@@ -2266,7 +2412,8 @@ class MainActivity : AppCompatActivity() {
         val resolvedSources: Int,
         val emptySources: Int,
         val rejectedByContentFilter: Int,
-        val failures: List<String>
+        val failures: List<String>,
+        val filterDetails: List<String> = emptyList()
     ) {
         fun summary(): String = buildString {
             append("المصادر المرشحة: ").append(attempted)
@@ -2277,6 +2424,10 @@ class MainActivity : AppCompatActivity() {
             if (failures.isNotEmpty()) {
                 append("\nأسباب تعذر التحليل:")
                 failures.take(5).forEach { append("\n• ").append(it) }
+            }
+            if (filterDetails.isNotEmpty()) {
+                append("\nتفاصيل صيغ استبعدها فلتر المحتوى:")
+                filterDetails.take(4).forEach { append("\n• ").append(it) }
             }
             if (formats.isEmpty() && failures.isEmpty()) {
                 append("\nلم ينتج أي مصدر صيغة فيديو مقبولة؛ تحقق من نوع الاستجابة أو تصنيف الإعلان/المعاينة.")
@@ -2331,6 +2482,7 @@ class MainActivity : AppCompatActivity() {
             d > 20.0 && (expectedDuration !in 1.0..12.0 || d >= expectedDuration + maxOf(20.0, expectedDuration * 2.0))
         }
         var rejectedByContentFilter = 0
+        val filterDetails = ArrayList<String>()
         val usable = groups.mapNotNull { (item, formats) ->
             val requiresNetworkDurationProof = item.origin == "network-pending-ad"
             val isPredeclaredPlayerSource = item.origin == "dom-preroll"
@@ -2357,7 +2509,15 @@ class MainActivity : AppCompatActivity() {
                     expectedDuration <= 0.0 && longest > 20.0 -> d <= 0.0 || d >= maxOf(20.0, longest * 0.35)
                     else -> true
                 }
-                if (!accepted) rejectedByContentFilter++
+                if (!accepted) {
+                    rejectedByContentFilter++
+                    if (filterDetails.size < 8) {
+                        val host = try { Uri.parse(item.url).host ?: "مصدر" } catch (_: Exception) { "مصدر" }
+                        val expectedText = if (expectedDuration > 0.0) String.format(java.util.Locale.US, "%.0fs", expectedDuration) else "غير معلنة"
+                        val actualText = if (d > 0.0) String.format(java.util.Locale.US, "%.0fs", d) else "غير معروفة"
+                        filterDetails.add("$host / ${item.captureSource.ifBlank { item.origin }} / ${format.label}: مدة $actualText مقابل $expectedText")
+                    }
+                }
                 accepted
             }
             if (checkedFormats.isEmpty()) null else item to checkedFormats
@@ -2388,7 +2548,7 @@ class MainActivity : AppCompatActivity() {
                 .thenBy { it.codec }
                 .thenBy { it.url }
         )
-        return ResolveOutcome(sorted, candidates.size, groups.size, emptySources, rejectedByContentFilter, failures)
+        return ResolveOutcome(sorted, candidates.size, groups.size, emptySources, rejectedByContentFilter, failures, filterDetails)
     }
 
     private fun scheduleBackgroundResolve(t: Tab) {
@@ -2419,6 +2579,7 @@ class MainActivity : AppCompatActivity() {
                 "webview" -> 1
                 "fetch", "xhr", "service-worker" -> 2
                 "player-flashvars" -> 3
+                "player-xhamster" -> 3
                 else -> 4
             } }
                 .thenBy { if (it.type == "hls") 0 else 1 }
@@ -2435,14 +2596,27 @@ class MainActivity : AppCompatActivity() {
                 ResolveOutcome(emptyList(), items.size, 0, 0, 0, listOf(shortResolveError(e)))
             }
             ui.post {
-                if (tabs.any { it === t } && t.primaryVideoId == videoId &&
-                    t.primarySourceEpoch == epoch && resolutionKey(t) == key) {
+                val stillCurrent = tabs.any { it === t } && t.primaryVideoId == videoId &&
+                    t.primarySourceEpoch == epoch && resolutionKey(t) == key
+                if (stillCurrent) {
                     t.resolvedFormats = outcome.formats
                     t.resolvedKey = key
                     t.lastResolveReport = outcome.summary()
                 }
                 if (t.resolvingKey == key) t.resolvingKey = ""
-                if (cur === t) updateFab()
+                if (cur === t) {
+                    updateFab()
+                    if (stillCurrent && t.pendingFormatSheet && !t.primaryIsAd && !t.suspectedPreroll) {
+                        t.pendingFormatSheet = false
+                        if (outcome.formats.isNotEmpty()) {
+                            showFormatSheet(outcome.formats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
+                        } else {
+                            showDiscoveryDiagnostics(t, "اكتمل تحليل المصادر، لكن لم ينتج خيار تنزيل صالحًا.")
+                        }
+                    }
+                } else if (!stillCurrent || !tabs.any { it === t }) {
+                    t.pendingFormatSheet = false
+                }
             }
         }
     }
@@ -2789,6 +2963,7 @@ class MainActivity : AppCompatActivity() {
 
         val primaryChanged = t.primaryVideoId != id
         if (primaryChanged) {
+            t.pendingFormatSheet = false
             t.syntheticApiUpdatedAt = 0L
             t.primaryFrameOrigin = ""
             t.primaryFrameId = ""
@@ -2824,6 +2999,14 @@ class MainActivity : AppCompatActivity() {
         if (pageQualities != null) {
             val q = (0 until minOf(pageQualities.length(), 16)).map { pageQualities.optString(it).take(12) }.filter { it.isNotBlank() }.distinct()
             if (q.isNotEmpty()) t.playerDefinitionQualities = q.joinToString(", ")
+        }
+        t.xhamsterStateFound = t.xhamsterStateFound || p.optBoolean("xhamsterStateFound", false)
+        t.xhamsterSourceCount = maxOf(t.xhamsterSourceCount, p.optInt("xhamsterSourceCount", 0).coerceIn(0, 64))
+        t.xhamsterOpaqueCount = maxOf(t.xhamsterOpaqueCount, p.optInt("xhamsterOpaqueCount", 0).coerceIn(0, 128))
+        val xhQualities = p.optJSONArray("xhamsterQualities")
+        if (xhQualities != null) {
+            val values = (0 until minOf(xhQualities.length(), 24)).map { xhQualities.optString(it).take(16) }.filter { it.isNotBlank() }.distinct()
+            if (values.isNotEmpty()) t.xhamsterQualities = values.joinToString(", ")
         }
         t.playerVideoDurationSec = p.optDouble("playerVideoDuration", 0.0).takeIf { it.isFinite() && it in 0.0..86400.0 } ?: 0.0
         t.playerAdReason = p.optString("adReason").take(80)
@@ -2915,6 +3098,10 @@ class MainActivity : AppCompatActivity() {
             if (t.playerDefinitionQualities.isNotBlank()) append(" / الجودات: ").append(t.playerDefinitionQualities)
             if (t.playerVideoDurationSec > 0.0) append(" / مدة المحتوى المعلنة: ").append(String.format(java.util.Locale.US, "%.0f ثانية", t.playerVideoDurationSec))
             if (t.playerAdReason.isNotBlank()) append(" / إشارة الإعلان: ").append(t.playerAdReason)
+            append("\nمصادر xHamster: ").append(if (t.xhamsterStateFound) "initials متاحة" else "initials غير مرصودة")
+                .append(" / روابط مباشرة: ").append(t.xhamsterSourceCount)
+                .append(" / قيم غير قابلة للقراءة: ").append(t.xhamsterOpaqueCount)
+            if (t.xhamsterQualities.isNotBlank()) append(" / الجودات: ").append(t.xhamsterQualities)
             append("\n")
             append("جسر WebMessage Listener: ").append(if (t.frameBridgeRegistered) "مسجل" else "لم يسجل")
             if (t.frameBridgeError.isNotBlank()) append(" — ").append(t.frameBridgeError)
@@ -2971,15 +3158,17 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (t.resolvingKey == key) {
-            toast("جارٍ تجهيز جودات الفيديو في الخلفية؛ اضغط مرة أخرى بعد اكتمال التحضير")
+            t.pendingFormatSheet = true
+            toast("جارٍ تجهيز جودات الفيديو؛ ستظهر قائمة التحميل تلقائيًا عند اكتمالها")
             return
         }
         if (t.resolvedKey == key && cached.isNullOrEmpty()) {
             showDiscoveryDiagnostics(t, "تم التقاط مصادر، لكن لم ينتج عنها أي خيار تنزيل صالح.")
             return
         }
+        t.pendingFormatSheet = true
         scheduleBackgroundResolve(t)
-        toast("بدأ تجهيز جودات الفيديو؛ اضغط مرة أخرى بعد اكتمال التحضير")
+        toast("بدأ تجهيز جودات الفيديو؛ ستظهر قائمة التحميل تلقائيًا عند اكتمالها")
     }
 
     private fun qualityRank(label: String): Int =

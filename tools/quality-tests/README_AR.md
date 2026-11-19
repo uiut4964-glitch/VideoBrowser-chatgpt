@@ -1,4 +1,4 @@
-# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.5 / Stage 3.5 – Blob/MSE renditions and frame playback
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.6 / Stage 3.6 – Blob/MSE renditions and frame playback
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 
@@ -17,6 +17,7 @@ node test_frame_video_capture.js
 node test_frame_probe_shadow.js
 node test_preroll_gate.js
 node test_stage35_invariants.js
+node test_xhamster_sources.js
 ```
 
 وتتحقق من:
@@ -78,3 +79,13 @@ java --add-modules jdk.httpserver -jar /tmp/vb-net-probe-test.jar
 `NetTestSupport.kt` وملفات `android/*` بدائل اختبار فقط؛ لا تنقلها إلى `app/src/main`.
 
 يُفحص ملف JavaScript المحقون عند بداية المستند منفصلًا بواسطة: `kotlinc app/src/main/java/com/example/videobrowser/ApiCaptureScript.kt -d /tmp/vb-early-api-capture.jar`.
+
+
+## اختبارات Stage 3.6
+
+- قراءة `initials.videoModel.sources` داخل الصفحة الرئيسية وداخل iframe عابر للنطاق.
+- قراءة `xplayerSettings.sources` من البنية المعلنة فقط.
+- الاحتفاظ بجودات MP4 وHLS الصريحة، بما فيها 1440p/2160p عندما تكون موجودة فعلًا في البيانات المكشوفة.
+- عدم فك قيم h264/opaque أو التعامل مع روابط download كتمثيلات تشغيل.
+- استبعاد مصادر player-xhamster أثناء الإعلان، ورفض قوائم Resource Timing القديمة السابقة لانتقال الإعلان إلى المحتوى.
+- إضافة تفاصيل تشخيصية للمدة المتوقعة والمدة المكتشفة عندما يرفض Content Filter صيغة.
