@@ -255,6 +255,155 @@ internal const val EARLY_API_CAPTURE_JS = """
       };
       xhrProto.__vbEarlyCaptureWrapped = true;
     }
+
+    // Cross-origin players may contain the only VIDEO element while the top document has none.
+    // Report bounded, non-secret player state directly to the native WebMessageListener.
+    if (window !== window.top && !window.__vbFrameVideoObserverInstalled) {
+      window.__vbFrameVideoObserverInstalled = true;
+      var frameId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      var frameVideoCounter = 0;
+      var frameVideoLast = Object.create(null);
+      var pointerState = { x: -1, y: -1, at: 0 };
+      var frameAdPattern = /(?:doubleclick|googlesyndication|googleadservices|imasdk|vasttag|adservice|adserver|preroll|midroll|postroll)/i;
+
+      function frameVisible(video) {
+        try {
+          var style = getComputedStyle(video);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+          var r = video.getBoundingClientRect();
+          return r.width >= 70 && r.height >= 45 && r.right > 0 && r.bottom > 0 &&
+            r.left < window.innerWidth && r.top < window.innerHeight;
+        } catch (_) { return false; }
+      }
+
+      function frameAd(video, src) {
+        if (frameAdPattern.test(String(src || ''))) return true;
+        try {
+          var node = video;
+          for (var depth = 0; node && depth < 7; depth++, node = node.parentElement) {
+            var marker = String(node.id || '') + ' ' + String(node.className || '') + ' ' +
+              String(node.getAttribute && (node.getAttribute('data-ad') || node.getAttribute('data-ad-playing')) || '');
+            if (/(^|[\s_-])(ima-ad-container|video-ads|ad-container|ad-player|ad-playing|advertisement|jw-ad|vjs-ad-playing|ad-showing|preroll|midroll|postroll)(?=$|[\s_-])/i.test(marker)) return true;
+          }
+        } catch (_) {}
+        return false;
+      }
+
+      function frameMediaSources(video) {
+        var result = [];
+        var seen = Object.create(null);
+        function add(raw, meta) {
+          try {
+            var value = String(raw || '').trim();
+            if (!value || /^blob:/i.test(value) || /^data:/i.test(value)) return;
+            var url = new URL(value, document.baseURI).href;
+            if (!/^https?:/i.test(url) || frameAdPattern.test(url) || isPreviewFrameUrl(url)) return;
+            if (!seen[url] && result.length < 32) {
+              seen[url] = true;
+              result.push({ url: url, meta: meta || {} });
+            }
+          } catch (_) {}
+        }
+        function isPreviewFrameUrl(url) {
+          return /(?:^|[\/_.?&=-])(preview|thumbnail|thumb|poster|trailer|teaser|sprite)(?:[\/_.?&=-]|$)/i.test(String(url || ''));
+        }
+        try {
+          add(video.currentSrc || video.getAttribute('src'), {
+            mime: 'video', width: Number(video.videoWidth || 0), height: Number(video.videoHeight || 0)
+          });
+        } catch (_) {}
+        try {
+          var children = video.querySelectorAll('source[src],source[data-src]');
+          for (var i = 0; i < Math.min(children.length, 32); i++) {
+            var node = children[i];
+            var label = node.getAttribute('label') || node.getAttribute('data-quality') || '';
+            var height = Number(node.getAttribute('data-height') || node.getAttribute('height') || 0);
+            var type = node.getAttribute('type') || '';
+            add(node.getAttribute('src') || node.getAttribute('data-src'), { label: label, height: height, mime: type });
+          }
+        } catch (_) {}
+        try {
+          var node = video.parentElement;
+          for (var depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+            ['data-video-url','data-stream-url','data-hls','data-m3u8','data-file','data-src'].forEach(function(attr){
+              var raw = node.getAttribute && node.getAttribute(attr);
+              if (raw) add(raw, { mime: /m3u8/i.test(attr) ? 'application/vnd.apple.mpegurl' : '' });
+            });
+          }
+        } catch (_) {}
+        return result;
+      }
+
+      function sendFrameVideoState() {
+        try {
+          var bridge = window.VideoBrowserCapture;
+          if (!bridge || typeof bridge.postMessage !== 'function') return;
+          var nodes = document.querySelectorAll('video');
+          var videos = [];
+          for (var i = 0; i < Math.min(nodes.length, 8); i++) {
+            var video = nodes[i];
+            if (!video) continue;
+            if (!video.__vbFrameVideoId) video.__vbFrameVideoId = 'fv-' + (++frameVideoCounter).toString(36);
+            var src = String(video.currentSrc || video.getAttribute('src') || '');
+            var sources = frameMediaSources(video);
+            var sourceKey = src + '||' + sources.map(function(item){ return item.url; }).join('||');
+            var previous = frameVideoLast[video.__vbFrameVideoId] || { key: '', epoch: 0, cycle: 0, sentAt: 0 };
+            if (previous.key && previous.key !== sourceKey) previous.epoch++;
+            if (video.ended && !previous.ended) previous.cycle++;
+            previous.key = sourceKey;
+            previous.ended = !!video.ended;
+            var rect = video.getBoundingClientRect();
+            var playing = !video.paused && !video.ended;
+            var inBounds = frameVisible(video);
+            var gesture = Date.now() - pointerState.at <= 12000 && pointerState.x >= rect.left && pointerState.x <= rect.right &&
+              pointerState.y >= rect.top && pointerState.y <= rect.bottom;
+            var currentAd = frameAd(video, src);
+            var meta = sources.map(function(item){ return { url:item.url, label:item.meta.label || '',
+              width:Number(item.meta.width || 0), height:Number(item.meta.height || 0), mime:item.meta.mime || '' }; });
+            videos.push({
+              id: video.__vbFrameVideoId, src: src, sources: sources.map(function(item){ return item.url; }),
+              sourceMeta: meta, poster: String(video.poster || ''),
+              duration: Number.isFinite(Number(video.duration)) ? Number(video.duration) : 0,
+              currentTime: Number(video.currentTime || 0), paused: !!video.paused, ended: !!video.ended,
+              playing: playing, visible: inBounds, area: Math.max(0, Number(rect.width || 0) * Number(rect.height || 0)),
+              width: Number(video.videoWidth || 0), height: Number(video.videoHeight || 0),
+              ad: currentAd, gesture: gesture, sourceEpoch: previous.epoch, cycle: previous.cycle,
+              blob: /^blob:/i.test(src)
+            });
+            if (Date.now() - previous.sentAt > 900 || playing || sourceKey !== previous.lastSentKey) {
+              previous.sentAt = Date.now();
+              previous.lastSentKey = sourceKey;
+            }
+            frameVideoLast[video.__vbFrameVideoId] = previous;
+          }
+          if (!videos.length) return;
+          bridge.postMessage(JSON.stringify({
+            kind: 'frame-video-state', frameId: frameId, frameOrigin: String(location.origin || ''),
+            at: Date.now(), videos: videos
+          }));
+        } catch (_) {}
+      }
+
+      function framePointer(event) {
+        try {
+          var p = event.touches && event.touches.length ? event.touches[0] : event;
+          pointerState = { x: Number(p.clientX || -1), y: Number(p.clientY || -1), at: Date.now() };
+          sendFrameVideoState();
+        } catch (_) {}
+      }
+      document.addEventListener('pointerdown', framePointer, true);
+      document.addEventListener('touchstart', framePointer, true);
+      ['play','playing','loadedmetadata','loadeddata','durationchange','emptied','ended','pause','canplay'].forEach(function(name){
+        document.addEventListener(name, function(){ sendFrameVideoState(); }, true);
+      });
+      try {
+        if (window.MutationObserver) {
+          new MutationObserver(function(){ sendFrameVideoState(); }).observe(document, { childList: true, subtree: true });
+        }
+      } catch (_) {}
+      if (window.setInterval) window.setInterval(sendFrameVideoState, 1200);
+      sendFrameVideoState();
+    }
   } catch (_) {}
 })();
 """

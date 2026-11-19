@@ -883,6 +883,11 @@ class MainActivity : AppCompatActivity() {
         val requestContexts = LinkedHashMap<String, CapturedMediaRequest>()
         // Cross-origin iframe API payloads arrive through WebMessageListener and stay native-side.
         val frameApiPayloads = LinkedHashMap<String, String>()
+        // Cross-origin iframe player snapshots, held only in memory for the active page.
+        val frameVideoStates = LinkedHashMap<String, String>()
+        var primaryFrameOrigin = ""
+        var primaryFrameId = ""
+        var primaryFrameSeenAt = 0L
         var syntheticApiUpdatedAt = 0L
         // طلبات مرشحة ظهرت أثناء إعلان ما قبل التشغيل؛ لا تُعرض للمستخدم إلا بعد انتقال المصدر إلى المحتوى.
         val pendingSniffed = LinkedHashMap<String, Long>()
@@ -1284,6 +1289,10 @@ class MainActivity : AppCompatActivity() {
         t.documentStartScript = null
         t.requestContexts.clear()
         t.frameApiPayloads.clear()
+        t.frameVideoStates.clear()
+        t.primaryFrameOrigin = ""
+        t.primaryFrameId = ""
+        t.primaryFrameSeenAt = 0L
         t.syntheticApiUpdatedAt = 0L
         t.pendingSniffed.clear()
         t.pageRequests.clear()
@@ -1347,7 +1356,13 @@ class MainActivity : AppCompatActivity() {
                         replyProxy: JavaScriptReplyProxy
                     ) {
                         if (view !== tab.web || isMainFrame || message.type != WebMessageCompat.TYPE_STRING) return
-                        captureFrameApiPayload(tab, message.data ?: return, sourceOrigin.toString())
+                        val raw = message.data ?: return
+                        val actualOrigin = sourceOrigin.toString()
+                        val messageKind = if (raw.length <= 160_000) {
+                            try { JSONObject(raw).optString("kind") } catch (_: Exception) { "" }
+                        } else ""
+                        if (messageKind == "frame-video-state") captureFrameVideoState(tab, raw, actualOrigin)
+                        else captureFrameApiPayload(tab, raw, actualOrigin)
                     }
                 }
             )
@@ -1371,6 +1386,189 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * Receive bounded player state from a cross-origin iframe. The browser page cannot
+     * forge sourceOrigin: it is supplied by AndroidX WebMessageListener itself.
+     */
+    private fun captureFrameVideoState(t: Tab, raw: String, sourceOrigin: String) {
+        if (tabs.none { it === t } || raw.length !in 20..160_000 || !sourceOrigin.startsWith("http")) return
+        try {
+            val incoming = JSONObject(raw)
+            if (incoming.optString("kind") != "frame-video-state") return
+            val claimedOrigin = incoming.optString("frameOrigin")
+            if (!sameWebOrigin(claimedOrigin, sourceOrigin)) return
+            val frameId = incoming.optString("frameId").take(100)
+            val incomingVideos = incoming.optJSONArray("videos") ?: return
+            if (frameId.isBlank() || incomingVideos.length() == 0) return
+
+            val safeVideos = JSONArray()
+            for (i in 0 until minOf(incomingVideos.length(), 12)) {
+                val item = incomingVideos.optJSONObject(i) ?: continue
+                val videoId = item.optString("id").take(80)
+                if (videoId.isBlank()) continue
+                val sources = JSONArray()
+                val sourceMeta = JSONArray()
+                val sourceArray = item.optJSONArray("sources")
+                val metaArray = item.optJSONArray("sourceMeta")
+                val metaByUrl = HashMap<String, JSONObject>()
+                if (metaArray != null) {
+                    for (mi in 0 until minOf(metaArray.length(), 48)) {
+                        val meta = metaArray.optJSONObject(mi) ?: continue
+                        val url = meta.optString("url")
+                        if (url.isNotBlank()) metaByUrl[url] = meta
+                    }
+                }
+                val seen = HashSet<String>()
+                if (sourceArray != null) {
+                    for (si in 0 until minOf(sourceArray.length(), 48)) {
+                        val url = sourceArray.optString(si)
+                        if ((!url.startsWith("http://", true) && !url.startsWith("https://", true)) ||
+                            !isCandidatePlayerSource(url) || !seen.add(url)) continue
+                        sources.put(url)
+                        val m = metaByUrl[url] ?: JSONObject()
+                        sourceMeta.put(JSONObject()
+                            .put("url", url)
+                            .put("label", m.optString("label").take(80))
+                            .put("width", m.optInt("width", 0).coerceIn(0, 10000))
+                            .put("height", m.optInt("height", 0).coerceIn(0, 10000))
+                            .put("mime", m.optString("mime").take(120)))
+                    }
+                }
+                val src = item.optString("src").take(8192)
+                val duration = item.optDouble("duration", 0.0).let { if (it.isFinite() && it >= 0.0) it else 0.0 }
+                safeVideos.put(JSONObject()
+                    .put("id", videoId).put("src", src).put("sources", sources).put("sourceMeta", sourceMeta)
+                    .put("poster", item.optString("poster").take(4096))
+                    .put("duration", duration)
+                    .put("playing", item.optBoolean("playing", false))
+                    .put("visible", item.optBoolean("visible", false))
+                    .put("area", item.optDouble("area", 0.0).coerceIn(0.0, 100_000_000.0))
+                    .put("width", item.optInt("width", 0).coerceIn(0, 10000))
+                    .put("height", item.optInt("height", 0).coerceIn(0, 10000))
+                    .put("ad", item.optBoolean("ad", false) || isLikelyAdUrl(src))
+                    .put("gesture", item.optBoolean("gesture", false))
+                    .put("sourceEpoch", item.optInt("sourceEpoch", 0).coerceAtLeast(0))
+                    .put("cycle", item.optInt("cycle", 0).coerceAtLeast(0))
+                    .put("blob", item.optBoolean("blob", src.startsWith("blob:", true))))
+            }
+            if (safeVideos.length() == 0) return
+            val now = System.currentTimeMillis()
+            val key = "$sourceOrigin|$frameId"
+            val stored = JSONObject().put("origin", sourceOrigin).put("frameId", frameId)
+                .put("at", now).put("videos", safeVideos).toString()
+            t.frameVideoStates.remove(key)
+            t.frameVideoStates[key] = stored
+            t.frameVideoStates.entries.removeAll { entry ->
+                try { now - JSONObject(entry.value).optLong("at", 0L) !in 0L..15_000L }
+                catch (_: Exception) { true }
+            }
+            while (t.frameVideoStates.size > 16) {
+                val oldest = t.frameVideoStates.keys.firstOrNull() ?: break
+                t.frameVideoStates.remove(oldest)
+            }
+            applyFrameVideoStates(t)
+        } catch (_: Exception) {
+            // An invalid frame message is ignored without affecting the page.
+        }
+    }
+
+    private fun applyFrameVideoStates(t: Tab) {
+        // A real top-frame VIDEO selected by SCAN_JS always wins over iframe fallback.
+        val currentId = t.primaryVideoId
+        if (!currentId.isNullOrBlank() && !currentId.startsWith("frame-") && !currentId.startsWith("api-")) return
+        val now = System.currentTimeMillis()
+        data class Candidate(val origin: String, val frameId: String, val item: JSONObject)
+        val candidates = ArrayList<Candidate>()
+        t.frameVideoStates.values.forEach { encoded ->
+            try {
+                val snapshot = JSONObject(encoded)
+                if (now - snapshot.optLong("at", 0L) !in 0L..15_000L) return@forEach
+                val origin = snapshot.optString("origin")
+                val frameId = snapshot.optString("frameId")
+                val videos = snapshot.optJSONArray("videos") ?: return@forEach
+                for (i in 0 until videos.length()) {
+                    val item = videos.optJSONObject(i) ?: continue
+                    if (!item.optBoolean("visible", false) && !item.optBoolean("playing", false)) continue
+                    candidates += Candidate(origin, frameId, item)
+                }
+            } catch (_: Exception) {}
+        }
+        if (candidates.isEmpty()) return
+        val selected = candidates.sortedWith(
+            compareBy<Candidate> { it.item.optBoolean("ad", false) }
+                .thenByDescending { it.item.optBoolean("playing", false) }
+                .thenByDescending { it.item.optBoolean("gesture", false) }
+                .thenByDescending { it.item.optDouble("area", 0.0) }
+        ).first()
+        val item = selected.item
+        val videoId = item.optString("id")
+        val id = "frame-" + Integer.toHexString("${selected.origin}|${selected.frameId}|$videoId".hashCode())
+        val src = item.optString("src")
+        val sourceEpoch = item.optInt("sourceEpoch", 0)
+        val cycle = item.optInt("cycle", 0)
+        val isAd = item.optBoolean("ad", false)
+        val sourceKey = src + "||" + (item.optJSONArray("sources")?.let { arr ->
+            (0 until arr.length()).joinToString("||") { arr.optString(it) }
+        } ?: "")
+        val primaryChanged = t.primaryVideoId != id
+        val sourceChanged = primaryChanged || t.primarySourceKey != sourceKey ||
+            t.primarySourceEpoch != sourceEpoch || t.primaryCycle != cycle
+        val wasAd = t.primaryIsAd
+        val wasPreroll = t.suspectedPreroll
+        val duration = item.optDouble("duration", 0.0)
+        val nextPreroll = !isAd && duration in 0.001..12.0 &&
+            (item.optJSONArray("sources")?.length() ?: 0) > 0
+        if (primaryChanged) {
+            t.media.clear()
+            t.preparedMedia.clear()
+            t.sniffed.clear()
+            t.pendingSniffed.clear()
+            t.resolvedFormats = null
+            t.resolvedKey = ""
+            t.resolvingKey = ""
+        } else if (sourceChanged) {
+            t.sniffed.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
+            if (!wasAd && !isAd && !wasPreroll && !nextPreroll) {
+                t.preparedMedia.entries.removeAll { it.value.videoId == id && it.value.sourceEpoch != sourceEpoch }
+            }
+        }
+        t.primaryVideoId = id
+        t.primaryFrameOrigin = selected.origin
+        t.primaryFrameId = selected.frameId
+        t.primaryFrameSeenAt = now
+        t.primarySourceKey = sourceKey
+        t.primarySourceEpoch = sourceEpoch
+        t.primaryCycle = cycle
+        t.primaryCurrentSrc = src
+        t.primaryIsAd = isAd
+        t.suspectedPreroll = nextPreroll
+        t.expectedDurationSec = if (!isAd && !t.suspectedPreroll && duration > 12.0) duration else 0.0
+        if (!primaryChanged && (wasAd || wasPreroll) && !isAd && !nextPreroll) {
+            promotePendingSniffed(t, id, sourceEpoch)
+        }
+        t.sawBlob = item.optBoolean("blob", src.startsWith("blob:", true))
+        t.poster = item.optString("poster")
+        if (primaryChanged) promotePageRequests(t, id, sourceEpoch, isAd || t.suspectedPreroll)
+        val sources = item.optJSONArray("sources")
+        val metadata = item.optJSONArray("sourceMeta")
+        if (sources != null) {
+            val metaByUrl = HashMap<String, JSONObject>()
+            if (metadata != null) for (i in 0 until metadata.length()) {
+                val meta = metadata.optJSONObject(i) ?: continue
+                val url = meta.optString("url")
+                if (url.isNotBlank()) metaByUrl[url] = meta
+            }
+            for (i in 0 until sources.length()) addPreparedSource(t, sources.optString(i), id, metaByUrl[sources.optString(i)])
+        }
+        if (!isAd && !t.suspectedPreroll && item.optBoolean("playing", false) && item.optBoolean("gesture", false)) {
+            t.userGestureVideoIds.add(id)
+            t.userGestureAt = now
+        }
+        if ((t.primaryIsAd || t.suspectedPreroll) && !isAd) return
+        syncMedia(t)
+        if (cur === t) updateFab()
     }
 
     /** Validate and store bounded iframe API messages outside the page's JavaScript world. */
@@ -1700,6 +1898,10 @@ class MainActivity : AppCompatActivity() {
         t.sniffed.clear()
         t.requestContexts.clear()
         t.frameApiPayloads.clear()
+        t.frameVideoStates.clear()
+        t.primaryFrameOrigin = ""
+        t.primaryFrameId = ""
+        t.primaryFrameSeenAt = 0L
         t.syntheticApiUpdatedAt = 0L
         t.pendingSniffed.clear()
         t.pageRequests.clear()
@@ -2139,7 +2341,10 @@ class MainActivity : AppCompatActivity() {
             try { now - JSONObject(entry.value).optLong("at", 0L) !in 0L..180_000L }
             catch (_: Exception) { true }
         }
-        val pendingFramePayloads = LinkedHashMap(t.frameApiPayloads)
+        val pendingFramePayloads = LinkedHashMap(t.frameApiPayloads.filterValues { encoded ->
+            if (t.primaryFrameOrigin.isBlank()) true
+            else try { JSONObject(encoded).optString("frameOrigin") == t.primaryFrameOrigin } catch (_: Exception) { false }
+        })
         val nativeQueue = JSONArray()
         pendingFramePayloads.values.forEach { encoded ->
             try { nativeQueue.put(JSONObject(encoded)) } catch (_: Exception) {}
@@ -2169,7 +2374,22 @@ class MainActivity : AppCompatActivity() {
             // Some sites host the entire player in a cross-origin iframe, leaving no VIDEO
             // element in the top document. Use only early API/manifest candidates in that case.
             val orphanSources = o.optJSONArray("o")
-            if (orphanSources != null && orphanSources.length() > 0 &&
+            if (orphanSources != null && orphanSources.length() > 0 && t.primaryVideoId?.startsWith("frame-") == true) {
+                // API/manifests captured inside the selected iframe belong to its already identified player.
+                val id = t.primaryVideoId!!
+                val metadataArray = o.optJSONArray("om")
+                val metadata = HashMap<String, JSONObject>()
+                if (metadataArray != null) for (i in 0 until metadataArray.length()) {
+                    val item = metadataArray.optJSONObject(i) ?: continue
+                    val url = item.optString("url")
+                    if (url.isNotBlank()) metadata[url] = item
+                }
+                for (i in 0 until orphanSources.length()) {
+                    val url = orphanSources.optString(i)
+                    addPreparedSource(t, url, id, metadata[url])
+                }
+                syncMedia(t)
+            } else if (orphanSources != null && orphanSources.length() > 0 &&
                 (t.primaryVideoId == null || t.primaryVideoId?.startsWith("api-") == true)) {
                 val id = "api-" + Integer.toHexString(t.url.substringBefore('#').hashCode())
                 val urls = ArrayList<String>(orphanSources.length())
@@ -2262,6 +2482,9 @@ class MainActivity : AppCompatActivity() {
         val primaryChanged = t.primaryVideoId != id
         if (primaryChanged) {
             t.syntheticApiUpdatedAt = 0L
+            t.primaryFrameOrigin = ""
+            t.primaryFrameId = ""
+            t.primaryFrameSeenAt = 0L
             t.media.clear()
             t.preparedMedia.clear()
             t.sniffed.clear()
@@ -2344,6 +2567,10 @@ class MainActivity : AppCompatActivity() {
             append("طلبات تنتظر ربطها بالفيديو: ").append(t.pageRequests.size).append("\n")
             append("سياقات طلبات محفوظة: ").append(t.requestContexts.size).append("\n")
             append("رسائل API من الإطارات: ").append(t.frameApiPayloads.size).append("\n")
+            append("إطارات أرسلت حالة فيديو: ").append(t.frameVideoStates.size).append("\n")
+            append("إطار الفيديو الرئيسي: ").append(if (t.primaryFrameOrigin.isBlank()) "غير محدد" else Uri.parse(t.primaryFrameOrigin).host ?: "محدد").append("\n")
+            append("Document Start Script: ").append(if (t.documentStartCaptureInstalled) "مثبت" else "غير متاح/لم يثبت").append("\n")
+            append("Web Message Listener: ").append(if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) "مدعوم" else "غير مدعوم").append("\n")
             append("مصادر Resolver الحالية: ").append(t.media.size).append("\n")
             append("مصادر ضمن آخر محاولة تحليل: ").append(t.lastResolveCandidateCount).append("\n")
             append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" })

@@ -1,4 +1,4 @@
-# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.0 / Stage 3
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.1 / Stage 3.1 – iframe detection fix
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 
@@ -13,6 +13,7 @@ node test_scan_hls_payload.js
 node QualityMapConfigTest.js
 node test_early_api_capture.js
 node test_early_api_pipeline.js
+node test_frame_video_capture.js
 ```
 
 وتتحقق من:
