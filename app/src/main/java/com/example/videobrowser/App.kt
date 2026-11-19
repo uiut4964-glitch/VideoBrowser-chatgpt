@@ -9,6 +9,8 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         MediaCaptureCoordinator.installServiceWorkerClient()
+        // Initialize the bundled Python/QuickJS + yt-dlp runtime off the UI thread.
+        YtDlpExtractor.warmUp(this)
         val old = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             try {

@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
+import android.webkit.CookieManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -68,6 +69,22 @@ object DownloadCenter {
 
     // ---------- حفظ واسترجاع القائمة ----------
     private fun file() = File(ctx.filesDir, "tasks.json")
+
+    /**
+     * Build per-request headers without ever writing session cookies to tasks.json.
+     * CookieManager scopes cookies to the actual request URL, which also avoids
+     * forwarding a site's cookies to a different CDN host used by HLS segments.
+     */
+    private fun requestHeaders(t: Task, targetUrl: String): Map<String, String> {
+        val result = LinkedHashMap(t.headers)
+        try {
+            CookieManager.getInstance().getCookie(targetUrl)?.takeIf { it.isNotBlank() }?.let {
+                result["Cookie"] = it
+            }
+        } catch (_: Exception) {
+        }
+        return result
+    }
 
     @Synchronized
     fun save() {
@@ -288,7 +305,7 @@ object Engine {
     // ---------- تحميل ملف مباشر بأجزاء متوازية ----------
     fun direct(t: Task, alive: () -> Boolean) {
         val dir = tmpDir(t)
-        val p = Net.probe(t.url, t.headers)
+        val p = Net.probe(t.url, requestHeaders(t, t.url))
         val oldTotal = t.total
         val hadParts = dir.listFiles()?.any { it.name.matches(Regex("p\\d+")) } ?: false
         if (hadParts && oldTotal > 0 && p.total > 0 && p.total != oldTotal) {
@@ -366,7 +383,7 @@ object Engine {
         if (end >= 0 && start + have == end + 1L) return
         val rs = start + have
         val range = if (t.rangeOk) "bytes=$rs-" + (if (end >= 0) end.toString() else "") else null
-        val c = Net.connect(t.url, t.headers, range)
+        val c = Net.connect(t.url, requestHeaders(t, t.url), range)
         try {
             val code = c.responseCode
             if (t.rangeOk) {
@@ -411,7 +428,7 @@ object Engine {
     // ---------- تحميل HLS (m3u8) ----------
     fun hls(t: Task, alive: () -> Boolean) {
         val dir = tmpDir(t)
-        val playlistText = Net.fetchText(t.url, t.headers)
+        val playlistText = Net.fetchText(t.url, requestHeaders(t, t.url))
         val media = Hls.parseMedia(playlistText, t.url)
         if (media.segs.isEmpty()) throw IOException("لا توجد مقاطع للتحميل")
 
@@ -457,7 +474,7 @@ object Engine {
 
         val keys = ConcurrentHashMap<String, ByteArray>()
         fun keyFor(uri: String): ByteArray = keys[uri] ?: synchronized(keys) {
-            keys[uri] ?: Net.readBytes(uri, t.headers).also {
+            keys[uri] ?: Net.readBytes(uri, requestHeaders(t, uri)).also {
                 if (it.size != 16) throw IOException("حجم مفتاح AES-128 غير صحيح")
                 keys[uri] = it
             }
@@ -467,9 +484,9 @@ object Engine {
             val f = File(dir, "init")
             if (!f.exists()) {
                 var data = if (init.rangeStart != null && init.rangeLength != null) {
-                    Net.readRangeBytes(init.url, t.headers, init.rangeStart, init.rangeLength)
+                    Net.readRangeBytes(init.url, requestHeaders(t, init.url), init.rangeStart, init.rangeLength)
                 } else {
-                    Net.readBytes(init.url, t.headers)
+                    Net.readBytes(init.url, requestHeaders(t, init.url))
                 }
                 if (init.keyUri != null) data = Hls.decrypt(data, keyFor(init.keyUri), init.iv, 0L)
                 val tmp = File(dir, "init.tmp")
@@ -510,8 +527,8 @@ object Engine {
                         val seg = media.segs[i]
                         var data = withRetry(ok) {
                             if (seg.rangeStart != null && seg.rangeLength != null) {
-                                Net.readRangeBytes(seg.url, t.headers, seg.rangeStart, seg.rangeLength)
-                            } else Net.readBytes(seg.url, t.headers)
+                                Net.readRangeBytes(seg.url, requestHeaders(t, seg.url), seg.rangeStart, seg.rangeLength)
+                            } else Net.readBytes(seg.url, requestHeaders(t, seg.url))
                         }
                         if (seg.keyUri != null) data = Hls.decrypt(data, keyFor(seg.keyUri), seg.iv, seg.seq)
                         if (!ok()) break

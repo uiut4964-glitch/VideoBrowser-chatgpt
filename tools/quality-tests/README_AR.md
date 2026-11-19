@@ -18,6 +18,7 @@ node test_frame_probe_shadow.js
 node test_preroll_gate.js
 node test_stage35_invariants.js
 node test_xhamster_sources.js
+node test_ytdlp_integration.js
 ```
 
 وتتحقق من:
@@ -80,6 +81,10 @@ java --add-modules jdk.httpserver -jar /tmp/vb-net-probe-test.jar
 
 يُفحص ملف JavaScript المحقون عند بداية المستند منفصلًا بواسطة: `kotlinc app/src/main/java/com/example/videobrowser/ApiCaptureScript.kt -d /tmp/vb-early-api-capture.jar`.
 
+
+## اختبار دمج yt-dlp (الإصدار 1.11.7)
+
+يشغّل `node test_ytdlp_integration.js` للتحقق من اعتماد Maven الرسمي `youtubedl-android:0.18.1`، واستدعاء `YoutubeDL.getInfo()` الفعلي، وبدء تحليل الصفحة قبل التشغيل، وتمرير Cookies عند الطلب دون حفظها داخل ملف مهام التنزيل، وربط الصيغ بزر القائمة، وحماية عدم عرض DASH غير المدعوم بعد.
 
 ## اختبارات Stage 3.6
 

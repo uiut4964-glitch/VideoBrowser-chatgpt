@@ -1143,6 +1143,13 @@ class MainActivity : AppCompatActivity() {
         @Volatile var pendingFormatSheet = false
         @Volatile var lastResolveReport = "لم يبدأ تحليل المصادر بعد"
         @Volatile var lastResolveCandidateCount = 0
+        // Results extracted directly from the page URL by the real yt-dlp engine.
+        @Volatile var ytdlpFormats: List<Format>? = null
+        @Volatile var ytdlpPageUrl = ""
+        @Volatile var ytdlpLoadingUrl = ""
+        @Volatile var ytdlpAttemptedUrl = ""
+        @Volatile var ytdlpReport = "لم يبدأ استخراج yt-dlp بعد"
+        @Volatile var ytdlpGeneration = 0
         @Volatile var activeId: String? = null
         // Short-lived native frame playback proof prevents the periodic top-page scan
         // from clearing the FAB state when the actual player lives inside an iframe.
@@ -1546,6 +1553,11 @@ class MainActivity : AppCompatActivity() {
         t.resolvedFormats = null
         t.resolvedKey = ""
         t.resolvingKey = ""
+        t.ytdlpGeneration++
+        t.ytdlpFormats = null
+        t.ytdlpPageUrl = ""
+        t.ytdlpLoadingUrl = ""
+        t.ytdlpAttemptedUrl = ""
         content.removeView(t.web)
         t.web.destroy()
         if (cur === t) cur = null
@@ -2107,6 +2119,9 @@ class MainActivity : AppCompatActivity() {
                 // idempotent observer after navigation. Child frames still use document-start.
                 try { v.evaluateJavascript(EARLY_API_CAPTURE_JS, null) } catch (_: Exception) {}
                 scan(t)
+                // Start page-first yt-dlp extraction after the document has loaded;
+                // this does not require pressing Play and does not change the FAB state.
+                startYtDlpPreflight(t, url)
             }
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
@@ -2326,6 +2341,12 @@ class MainActivity : AppCompatActivity() {
         t.resolvingKey = ""
         t.lastResolveReport = "لم يبدأ تحليل المصادر بعد"
         t.lastResolveCandidateCount = 0
+        t.ytdlpGeneration++
+        t.ytdlpFormats = null
+        t.ytdlpPageUrl = ""
+        t.ytdlpLoadingUrl = ""
+        t.ytdlpAttemptedUrl = ""
+        t.ytdlpReport = "لم يبدأ استخراج yt-dlp بعد"
         t.activePlayback = false
         t.activeId = null
         t.framePlaybackActiveId = null
@@ -2598,18 +2619,19 @@ class MainActivity : AppCompatActivity() {
             ui.post {
                 val stillCurrent = tabs.any { it === t } && t.primaryVideoId == videoId &&
                     t.primarySourceEpoch == epoch && resolutionKey(t) == key
+                val combinedFormats = mergeFormatLists(outcome.formats, t.ytdlpFormats.orEmpty())
                 if (stillCurrent) {
-                    t.resolvedFormats = outcome.formats
+                    t.resolvedFormats = combinedFormats
                     t.resolvedKey = key
-                    t.lastResolveReport = outcome.summary()
+                    t.lastResolveReport = outcome.summary() + if (t.ytdlpReport.isNotBlank()) "\n" + t.ytdlpReport else ""
                 }
                 if (t.resolvingKey == key) t.resolvingKey = ""
                 if (cur === t) {
                     updateFab()
                     if (stillCurrent && t.pendingFormatSheet && !t.primaryIsAd && !t.suspectedPreroll) {
                         t.pendingFormatSheet = false
-                        if (outcome.formats.isNotEmpty()) {
-                            showFormatSheet(outcome.formats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
+                        if (combinedFormats.isNotEmpty()) {
+                            showFormatSheet(combinedFormats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
                         } else {
                             showDiscoveryDiagnostics(t, "اكتمل تحليل المصادر، لكن لم ينتج خيار تنزيل صالحًا.")
                         }
@@ -3114,8 +3136,10 @@ class MainActivity : AppCompatActivity() {
             append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" }).append("\n")
             append("قوائم HLS/DASH المرصودة من تحميل المشغل: ").append(t.preparedMedia.values.count { it.captureSource == "performance-manifest" }).append("\n")
             append("روابط موقعة منتهية حسب validto/expires: ").append(t.preparedMedia.keys.count { MediaUrlExpiry.isExpired(it) }).append("\n")
-            if (t.lastResolveReport.isNotBlank()) append("\nتقرير التحليل:\n").append(t.lastResolveReport)
-            append("\n\nالبيانات لا تتضمن روابط موقّعة أو Cookies أو Authorization.")
+            append("محرك yt-dlp: ").append(YtDlpExtractor.status(this)).append("\n")
+            append("استخراج صفحة الموقع: ").append(t.ytdlpReport).append("\n")
+            if (t.lastResolveReport.isNotBlank()) append("\nتقرير تحليل WebView/Manifest:\n").append(t.lastResolveReport)
+            append("\n\nالتشخيص لا يعرض Cookies أو Authorization أو قيم الروابط الموقعة.")
         }
         AlertDialog.Builder(this)
             .setTitle("تشخيص اكتشاف الصيغ")
@@ -3129,14 +3153,138 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun pageExtractionKey(rawUrl: String): String = rawUrl.substringBefore('#').trim()
+
+    private fun shouldUseYtDlpPageExtractor(rawUrl: String): Boolean {
+        if (!rawUrl.startsWith("http://", true) && !rawUrl.startsWith("https://", true)) return false
+        val uri = try { Uri.parse(rawUrl) } catch (_: Exception) { return false }
+        val host = uri.host.orEmpty().lowercase()
+        val path = uri.path.orEmpty().lowercase()
+        val query = uri.query.orEmpty().lowercase()
+        fun isDomain(domain: String) = host == domain || host.endsWith(".$domain")
+        val targetHost = isDomain("xhamster.com") || isDomain("xhamster.one") ||
+            isDomain("xhamster.desi") || isDomain("xhms.pro") ||
+            isDomain("xhday.com") || isDomain("xhvid.com") ||
+            Regex("^xhamster\\d+\\.(?:com|desi)$").matches(host) ||
+            isDomain("pornhub.com") || isDomain("pornhubpremium.com") ||
+            isDomain("pornhub.net") || isDomain("pornhub.org") || isDomain("thumbzilla.com")
+        val videoPath = Regex("(?:^|/)(?:watch|video|videos|movie|movies|embed|shorts|reel|clip)(?:/|$)")
+            .containsMatchIn(path)
+        val videoQuery = query.contains("viewkey=") || query.contains("video_id=") ||
+            query.contains("video=") || query.contains("idvideo=")
+        // Keep page-first extraction scoped to the services under active investigation.
+        // Generic sites continue to use the existing WebView/player capture until a
+        // dedicated site extractor has been validated for them.
+        return targetHost && (path.endsWith("view_video.php") || videoPath || videoQuery)
+    }
+
+    private fun mergeFormatLists(primary: List<Format>, secondary: List<Format>): List<Format> {
+        val byUrl = LinkedHashMap<String, Format>()
+        for (format in primary + secondary) {
+            if (format.url.isBlank()) continue
+            val old = byUrl[format.url]
+            if (old == null) {
+                byUrl[format.url] = format
+            } else {
+                val oldScore = listOf(old.codec.isNotBlank(), old.frameRate > 0.0, old.bandwidth > 0L,
+                    old.bytes > 0L, old.requestHeaders.isNotEmpty()).count { it }
+                val newScore = listOf(format.codec.isNotBlank(), format.frameRate > 0.0, format.bandwidth > 0L,
+                    format.bytes > 0L, format.requestHeaders.isNotEmpty()).count { it }
+                if (newScore > oldScore || (newScore == oldScore && format.bytes > old.bytes)) byUrl[format.url] = format
+            }
+        }
+        return byUrl.values.sortedWith(
+            compareByDescending<Format> { qualityRank(it.label) }
+                .thenByDescending { it.frameRate }
+                .thenByDescending { it.bandwidth }
+                .thenByDescending { it.bytes }
+                .thenBy { it.codec }
+                .thenBy { it.url }
+        )
+    }
+
+    private fun startYtDlpPreflight(t: Tab, rawUrl: String) {
+        val pageUrl = pageExtractionKey(rawUrl)
+        if (!shouldUseYtDlpPageExtractor(pageUrl)) return
+        if (t.ytdlpPageUrl == pageUrl && !t.ytdlpFormats.isNullOrEmpty()) return
+        if (t.ytdlpLoadingUrl == pageUrl || t.ytdlpAttemptedUrl == pageUrl) return
+
+        t.ytdlpLoadingUrl = pageUrl
+        val generation = ++t.ytdlpGeneration
+        t.ytdlpReport = "يحلل yt-dlp صفحة الفيديو مباشرة قبل التشغيل..."
+        val requestHeaders = LinkedHashMap(headersFor(t))
+        YtDlpExtractor.extract(applicationContext, pageUrl, requestHeaders) { result ->
+            ui.post {
+                if (tabs.none { it === t } || t.ytdlpGeneration != generation || t.ytdlpLoadingUrl != pageUrl) return@post
+                if (pageExtractionKey(t.url) != pageUrl) {
+                    t.ytdlpLoadingUrl = ""
+                    return@post
+                }
+                t.ytdlpLoadingUrl = ""
+                t.ytdlpAttemptedUrl = pageUrl
+                t.ytdlpPageUrl = pageUrl
+                t.ytdlpFormats = result.formats
+                t.ytdlpReport = buildString {
+                    append("yt-dlp ").append(result.version.ifBlank { "المضمن" })
+                    if (result.extractor.isNotBlank()) append(" / المستخرج: ").append(result.extractor)
+                    append(" / الصيغ الصالحة: ").append(result.formats.size)
+                    if (result.durationSec > 0.0) append(" / المدة: ").append(result.durationSec.toInt()).append("s")
+                    if (result.error.isNotBlank()) append(" / ").append(result.error)
+                }
+                if (result.formats.isNotEmpty()) {
+                    t.resolvedFormats = mergeFormatLists(t.resolvedFormats.orEmpty(), result.formats)
+                    if (!t.primaryVideoId.isNullOrBlank()) t.resolvedKey = resolutionKey(t)
+                }
+                if (cur === t && t.pendingFormatSheet && !t.primaryIsAd && !t.suspectedPreroll) {
+                    t.pendingFormatSheet = false
+                    val formats = mergeFormatLists(t.resolvedFormats.orEmpty(), result.formats)
+                    if (formats.isNotEmpty()) {
+                        showFormatSheet(formats, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
+                    } else if (t.media.isNotEmpty()) {
+                        // yt-dlp had no usable result; the existing WebView/manifest path remains available.
+                        scheduleBackgroundResolve(t)
+                    } else {
+                        showDiscoveryDiagnostics(t, "لم ينتج yt-dlp خيار تنزيل صالحًا لهذه الصفحة. ${result.error}")
+                    }
+                }
+            }
+        }
+    }
+
     private fun onFabClick() {
         val t = cur ?: return
         if (t.primaryIsAd || t.suspectedPreroll) {
             showDiscoveryDiagnostics(t, "المشغل يعرض إعلانًا أو مصدرًا تمهيديًا؛ انتظر انتقاله إلى المحتوى ثم اضغط الزر مرة أخرى.")
             return
         }
+
+        val pageUrl = pageExtractionKey(t.web.url ?: t.url)
+        val ytdlpFormats = if (t.ytdlpPageUrl == pageUrl) t.ytdlpFormats.orEmpty() else emptyList()
+        if (ytdlpFormats.isNotEmpty()) {
+            val ready = mergeFormatLists(t.resolvedFormats.orEmpty(), ytdlpFormats)
+            if (ready.isNotEmpty()) {
+                showFormatSheet(ready, headersFor(t), if (t.title.isBlank()) Util.host(t.url) else t.title, t.poster)
+                return
+            }
+        }
+
         val videoId = t.primaryVideoId
         if (videoId == null || t.media.isEmpty()) {
+            if (shouldUseYtDlpPageExtractor(pageUrl)) {
+                t.pendingFormatSheet = true
+                if (t.ytdlpLoadingUrl == pageUrl) {
+                    toast("يستخرج yt-dlp جودات الصفحة مباشرة؛ ستظهر القائمة عند اكتمال التحليل")
+                } else if (t.ytdlpAttemptedUrl != pageUrl || t.ytdlpFormats.isNullOrEmpty()) {
+                    // A failed/empty extraction may be transient (network, session or
+                    // short-lived site response); a user retry starts a fresh request.
+                    t.ytdlpAttemptedUrl = ""
+                    startYtDlpPreflight(t, pageUrl)
+                    toast("أعيد طلب استخراج الجودات من صفحة الموقع")
+                } else {
+                    showDiscoveryDiagnostics(t, "لم يعثر yt-dlp على صيغ فيديو قابلة للتنزيل. ${t.ytdlpReport}")
+                }
+                return
+            }
             val message = when {
                 t.primaryIsAd -> "المشغل يعرض إعلانًا؛ لن نعرض روابطه الآن"
                 t.suspectedPreroll -> "المصدر الحالي قصير وغير معروف وقد يكون إعلانًا"
@@ -3148,13 +3296,17 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Keep page-first yt-dlp results alongside the existing WebView/manifest resolver.
+        if (shouldUseYtDlpPageExtractor(pageUrl) && t.ytdlpAttemptedUrl != pageUrl && t.ytdlpLoadingUrl != pageUrl) {
+            startYtDlpPreflight(t, pageUrl)
+        }
         val key = resolutionKey(t)
         val headers = headersFor(t)
         val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
         val cached = t.resolvedFormats
         if (t.resolvedKey == key && !cached.isNullOrEmpty()) {
-            showFormatSheet(cached, headers, title, poster)
+            showFormatSheet(mergeFormatLists(cached, ytdlpFormats), headers, title, poster)
             return
         }
         if (t.resolvingKey == key) {
@@ -3163,7 +3315,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (t.resolvedKey == key && cached.isNullOrEmpty()) {
-            showDiscoveryDiagnostics(t, "تم التقاط مصادر، لكن لم ينتج عنها أي خيار تنزيل صالح.")
+            showDiscoveryDiagnostics(t, "تم التقاط مصادر، لكن لم ينتج عنها أي خيار تنزيل صالح. ${t.ytdlpReport}")
             return
         }
         t.pendingFormatSheet = true

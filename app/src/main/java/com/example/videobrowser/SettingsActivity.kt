@@ -126,6 +126,23 @@ class SettingsActivity : AppCompatActivity() {
             choose("محرك البحث", names) { i -> Prefs.setEngine(this, names[i]) }
         }
 
+        add("محرك استخراج المواقع (yt-dlp)", YtDlpExtractor.status(this) + "\nاستخراج مستقل من صفحة الموقع قبل التشغيل") {
+            AlertDialog.Builder(this)
+                .setTitle("محرك yt-dlp")
+                .setMessage("يستخدم التطبيق مستخرجات yt-dlp الحقيقية، مع تمرير سياق الصفحة وملفات الارتباط وقت الاستخراج. تحديث المحرك ينزّل إصدار Stable من مستودع yt-dlp الرسمي.")
+                .setPositiveButton("فحص وتحديث") { _, _ ->
+                    Toast.makeText(this, "جارٍ فحص تحديث yt-dlp...", Toast.LENGTH_SHORT).show()
+                    YtDlpExtractor.update(this) { _, message ->
+                        runOnUiThread {
+                            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                            render()
+                        }
+                    }
+                }
+                .setNegativeButton("إغلاق", null)
+                .show()
+        }
+
         add("وضع سطح المكتب افتراضيًا", onOff(Prefs.desktop(this))) {
             Prefs.setDesktop(this, !Prefs.desktop(this)); render()
         }
