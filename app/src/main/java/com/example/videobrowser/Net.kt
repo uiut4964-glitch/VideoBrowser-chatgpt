@@ -100,7 +100,8 @@ object Net {
             val code = get.responseCode
             val mime = get.contentType?.substringBefore(';')?.trim() ?: ""
             if (code in 200..299) return Probe(get.contentLengthLong, false, mime)
-            throw IOException("HTTP $code (فشل فحص Range: HTTP $rangeCode، وHEAD: HTTP $headCode)")
+            val detail = if (code == 410) "الرابط لم يعد متاحًا أو انتهت صلاحيته لدى خادم الوسائط" else "تعذر التحقق من توفر المورد"
+            throw IOException("HTTP $code: $detail (فشل فحص Range: HTTP $rangeCode، وHEAD: HTTP $headCode)")
         } finally {
             // Do not call inputStream/readBytes here: this is a headers-only availability check.
             get.disconnect()

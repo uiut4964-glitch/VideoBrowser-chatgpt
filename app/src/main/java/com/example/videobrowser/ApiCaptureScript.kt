@@ -274,7 +274,7 @@ internal const val EARLY_API_CAPTURE_JS = """
       var frameAdDefinitionPattern = /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i;
       var observedRoots = [];
       var scanScheduled = false;
-      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [] };
+      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false };
 
       function sendFrameProbe(phase, lightCount, shadowCount, rootCount) {
         try {
@@ -306,7 +306,7 @@ internal const val EARLY_API_CAPTURE_JS = """
       }
 
       function frameAd(video, src) {
-        if (frameAdPattern.test(String(src || ''))) return true;
+        if (frameAdPattern.test(String(src || '')) || frameFlashvarsStats.explicitAd) return true;
         try {
           var node = video;
           for (var depth = 0; node && depth < 7; depth++, node = node.parentElement) {
@@ -315,6 +315,11 @@ internal const val EARLY_API_CAPTURE_JS = """
             if (/(^|[\s_-])(ima-ad-container|video-ads|ad-container|ad-player|ad-playing|advertisement|jw-ad|vjs-ad-playing|ad-showing|preroll|midroll|postroll)(?=$|[\s_-])/i.test(marker)) return true;
           }
         } catch (_) {}
+        var playerDuration = Number(frameFlashvarsStats.videoDuration || 0);
+        var currentDuration = Number(video && video.duration || 0);
+        if (playerDuration > 20 && currentDuration > 0 &&
+            currentDuration < playerDuration - Math.max(15, playerDuration * 0.15) &&
+            currentDuration / playerDuration < 0.80) return true;
         return false;
       }
 
@@ -367,7 +372,17 @@ internal const val EARLY_API_CAPTURE_JS = """
           frameFlashvarsStats.objects = Math.max(frameFlashvarsStats.objects, names.length);
           for (var fi = 0; fi < names.length; fi++) {
             var config = window[names[fi]];
-            var definitions = config && config.mediaDefinitions;
+            if (!config || typeof config !== 'object') continue;
+            var declaredDuration = Number(config.video_duration || config.videoDuration || config.duration || 0);
+            if (Number.isFinite(declaredDuration) && declaredDuration > frameFlashvarsStats.videoDuration && declaredDuration < 86400) {
+              frameFlashvarsStats.videoDuration = declaredDuration;
+            }
+            var adFlagNames = ['isAdPlaying','adPlaying','adActive','isAd','prerollActive','isPreroll','adBreakActive'];
+            for (var af = 0; af < adFlagNames.length; af++) {
+              var adValue = config[adFlagNames[af]];
+              if (adValue === true || adValue === 1 || /^(playing|active|preroll)$/i.test(String(adValue || ''))) frameFlashvarsStats.explicitAd = true;
+            }
+            var definitions = config.mediaDefinitions;
             if (!Array.isArray(definitions)) continue;
             frameFlashvarsStats.definitions = Math.max(frameFlashvarsStats.definitions, definitions.length);
             for (var di = 0; di < Math.min(definitions.length, 64); di++) {
@@ -392,6 +407,25 @@ internal const val EARLY_API_CAPTURE_JS = """
                 representationId: def.id || def.formatId || '', captureSource: 'player-flashvars'
               });
             }
+          }
+        } catch (_) {}
+        // Recover the active manifest used by a Blob/MSE player from Resource Timing.
+        // Only manifest URLs are retained; segment URLs and response bodies are never read.
+        try {
+          var entries = performance && performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+          var now = Date.now();
+          for (var pe = Math.max(0, entries.length - 320); pe < entries.length; pe++) {
+            var entry = entries[pe];
+            var resourceUrl = String(entry && entry.name || '');
+            if (!/^https?:/i.test(resourceUrl) || frameAdPattern.test(resourceUrl) || isPreviewFrameUrl(resourceUrl)) continue;
+            var path = '';
+            try { path = new URL(resourceUrl).pathname.toLowerCase(); } catch (_) {}
+            if (!/\.(m3u8|mpd)$/.test(path) && !/(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/.test(path) &&
+                !/[?&](?:format|type|mime|contenttype)=[^&]*(?:m3u8|mpegurl|dash|mpd)/i.test(resourceUrl)) continue;
+            var age = now - (Number(performance.timeOrigin || 0) + Number(entry.startTime || 0));
+            if (age < -5000 || age > 180000 || result.some(function(item){ return item.url === resourceUrl; })) continue;
+            result.push({url:resourceUrl, meta:{mime:/mpd/i.test(path) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'}});
+            if (result.length >= 32) break;
           }
         } catch (_) {}
         return result;
@@ -448,7 +482,7 @@ internal const val EARLY_API_CAPTURE_JS = """
 
       function sendFrameVideoState() {
         try {
-          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [] };
+          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false };
           var bridge = window.VideoBrowserCapture;
           if (!bridge || typeof bridge.postMessage !== 'function') return;
           var found = collectFrameVideos();
@@ -472,6 +506,13 @@ internal const val EARLY_API_CAPTURE_JS = """
             if (!video.__vbFrameVideoId) video.__vbFrameVideoId = 'fv-' + (++frameVideoCounter).toString(36);
             var src = String(video.currentSrc || video.getAttribute('src') || '');
             var sources = frameMediaSources(video);
+            var currentAd = frameAd(video, src);
+            if (currentAd) {
+              // Do not expose player renditions while the same element is serving an ad.
+              sources = sources.filter(function(item){
+                return item.meta.captureSource !== 'player-flashvars' && item.meta.captureSource !== 'performance-manifest';
+              });
+            }
             var sourceKey = src + '||' + sources.map(function(item){ return item.url; }).join('||');
             var previous = frameVideoLast[video.__vbFrameVideoId] || { key: '', epoch: 0, cycle: 0, sentAt: 0 };
             if (previous.key && previous.key !== sourceKey) previous.epoch++;
@@ -485,7 +526,6 @@ internal const val EARLY_API_CAPTURE_JS = """
               pointerState.y >= rect.top && pointerState.y <= rect.bottom;
             if (pointerHit) video.__vbFrameUserInitiated = true;
             var gesture = video.__vbFrameUserInitiated === true;
-            var currentAd = frameAd(video, src);
             var meta = sources.map(function(item){ return { url:item.url, label:item.meta.label || '',
               width:Number(item.meta.width || 0), height:Number(item.meta.height || 0), mime:item.meta.mime || '',
               captureSource:item.meta.captureSource || '', codec:item.meta.codec || '',
@@ -498,7 +538,12 @@ internal const val EARLY_API_CAPTURE_JS = """
               currentTime: Number(video.currentTime || 0), paused: !!video.paused, ended: !!video.ended,
               playing: playing, visible: inBounds, area: Math.max(0, Number(rect.width || 0) * Number(rect.height || 0)),
               width: Number(video.videoWidth || 0), height: Number(video.videoHeight || 0),
-              ad: currentAd, gesture: gesture, sourceEpoch: previous.epoch, cycle: previous.cycle,
+              ad: currentAd, adReason: frameFlashvarsStats.explicitAd ? 'player-ad-flag' :
+                (frameFlashvarsStats.videoDuration > 20 && Number(video.duration || 0) > 0 &&
+                 Number(video.duration || 0) < frameFlashvarsStats.videoDuration - Math.max(15, frameFlashvarsStats.videoDuration * 0.15) &&
+                 Number(video.duration || 0) / frameFlashvarsStats.videoDuration < 0.80 ? 'player-duration-mismatch' : ''),
+              playerVideoDuration: Number(frameFlashvarsStats.videoDuration || 0),
+              gesture: gesture, sourceEpoch: previous.epoch, cycle: previous.cycle,
               blob: /^blob:/i.test(src)
             });
             if (Date.now() - previous.sentAt > 900 || playing || sourceKey !== previous.lastSentKey) {
@@ -515,6 +560,8 @@ internal const val EARLY_API_CAPTURE_JS = """
             playerConfigObjectCount: frameFlashvarsStats.objects,
             playerMediaDefinitionCount: frameFlashvarsStats.definitions,
             playerDefinitionQualities: frameFlashvarsStats.qualities,
+            playerVideoDuration: frameFlashvarsStats.videoDuration,
+            playerExplicitAd: frameFlashvarsStats.explicitAd,
             at: Date.now(), videos: videos
           }));
           sendFrameProbe('scan-video-found', lightVideoCount, shadowVideoCount, found.shadowRoots);

@@ -22,7 +22,7 @@ const document = {
 const window = {
   innerWidth: 1200, innerHeight: 800,
   location: {href: document.baseURI},
-  flashvars_987: { mediaDefinitions: [
+  flashvars_987: { video_duration: 600, mediaDefinitions: [
     {format:'hls', quality:1080, videoUrl:'https://cdn.example/flashvars-1080.m3u8'},
     {format:'hls', quality:720, videoUrl:'https://cdn.example/flashvars-720.m3u8'},
     {format:'mp4', quality:480, videoUrl:'https://cdn.example/flashvars-480.mp4'},

@@ -1,4 +1,4 @@
-# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.4 / Stage 3.4 – Blob/MSE renditions and frame playback
+# اختبارات الالتقاط واستخراج الجودات — VideoBrowser 1.11.5 / Stage 3.5 – Blob/MSE renditions and frame playback
 
 هذه اختبارات محلية للمحلل وطبقة اكتشاف المصادر. لا تتصل بمواقع حقيقية ولا تثبت دعم كل مشغل.
 
@@ -15,6 +15,8 @@ node test_early_api_capture.js
 node test_early_api_pipeline.js
 node test_frame_video_capture.js
 node test_frame_probe_shadow.js
+node test_preroll_gate.js
+node test_stage35_invariants.js
 ```
 
 وتتحقق من:
@@ -30,6 +32,10 @@ node test_frame_probe_shadow.js
 - اختبار عدم إسقاط مصدر فيديو صغير عندما تكون بيانات النوع والدقة معلنة وموثوقة.
 - اختبار ربط سياق طلب WebView برابط player-declared opaque مطابق حرفيًا، مع منع إعادة استخدام سياق الإعلان أو سياق إطار مختلف أو سياق منتهي الصلاحية.
 - فحص CDN: عند رفض Range، يُجرّب HEAD ثم GET دون Range لقراءة الرؤوس فقط؛ لا يُقرأ جسم الفيديو في مرحلة الفحص.
+- فحص صلاحية روابط الوسائط الموقعة عبر validto/expires قبل الاتصال، وتفسير 410 كرابط لم يعد متاحًا.
+- اختبار تمرير سبب الإعلان ومدة المحتوى المعلنة من iframe إلى التشخيص الأصلي، وعدم بقاء إشارة الإعلان القديمة بعد بدء المحتوى.
+- التقاط أسماء قوائم HLS/DASH الحديثة التي حمّلها المشغل فعليًا من Resource Timing، دون قراءة أجسام المقاطع، مع إعطاء أولوية لهذه القوائم قبل روابط Flashvars القديمة.
+- كشف الإعلان عندما تختلف مدة عنصر الفيديو بوضوح عن مدة المحتوى المعلنة في flashvars، ومنع احمرار الزر أو فتح خيارات التنزيل أثناء الإعلان، ثم إعادة تعيين الحالة عند انتقال التبويب/المصدر.
 
 ## اختبارات Kotlin للمحلل وResolver
 
@@ -50,12 +56,14 @@ kotlinc \
   tools/quality-tests/HlsFormatsResolveTest.kt \
   tools/quality-tests/DirectQualityMetadataTest.kt \
   tools/quality-tests/CaptureHeadersTest.kt \
+  tools/quality-tests/MediaUrlExpiryTest.kt \
   -include-runtime -d /tmp/videobrowser-quality-tests.jar
 
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsMasterTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.HlsFormatsResolveTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.DirectQualityMetadataTestKt
 java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.CaptureHeadersTestKt
+java -cp /tmp/videobrowser-quality-tests.jar com.example.videobrowser.MediaUrlExpiryTestKt
 
 # Net probe fallback test (uses the local JVM HTTP server; no external network)
 kotlinc tools/quality-tests/android/content/Context.kt \

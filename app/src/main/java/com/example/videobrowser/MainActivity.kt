@@ -284,6 +284,8 @@ private const val SCAN_JS = """
       var flashvarsObjectCount = 0;
       var flashvarsDefinitionCount = 0;
       var flashvarsQualities = [];
+      var flashvarsVideoDuration = 0;
+      var flashvarsExplicitAd = false;
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -396,6 +398,13 @@ private const val SCAN_JS = """
         for (var fi = 0; fi < flashvarsNames.length; fi++) {
           var flashvars = window[flashvarsNames[fi]];
           if (!flashvars || typeof flashvars !== 'object') continue;
+          var declaredDuration = Number(flashvars.video_duration || flashvars.videoDuration || flashvars.duration || 0);
+          if (Number.isFinite(declaredDuration) && declaredDuration > flashvarsVideoDuration && declaredDuration < 86400) flashvarsVideoDuration = declaredDuration;
+          var adFlagNames = ['isAdPlaying','adPlaying','adActive','isAd','prerollActive','isPreroll','adBreakActive'];
+          for (var af = 0; af < adFlagNames.length; af++) {
+            if (flashvars[adFlagNames[af]] === true || flashvars[adFlagNames[af]] === 1 ||
+                /^(playing|active|preroll)$/i.test(String(flashvars[adFlagNames[af]] || ''))) flashvarsExplicitAd = true;
+          }
           var definitions = flashvars.mediaDefinitions;
           if (!Array.isArray(definitions)) continue;
           flashvarsDefinitionCount += definitions.length;
@@ -423,6 +432,25 @@ private const val SCAN_JS = """
             add(definitionUrl, definitionMeta);
           }
         }
+        // Blob/MSE players may fetch the active HLS/DASH manifest without exposing it as currentSrc.
+        // Read only recent manifest-like resource names; never inspect or copy media segment bodies.
+        try {
+          var perfEntries = performance && performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+          var perfNow = Date.now();
+          for (var pe = Math.max(0, perfEntries.length - 320); pe < perfEntries.length; pe++) {
+            var entry = perfEntries[pe];
+            var resourceUrl = String(entry && entry.name || '');
+            if (!isHttp(resourceUrl) || isAdUrl(resourceUrl) || isPreviewUrl(resourceUrl) || isChunkUrl(resourceUrl)) continue;
+            var resourcePath = '';
+            try { resourcePath = new URL(resourceUrl).pathname.toLowerCase(); } catch (_) {}
+            var manifestLike = /\.(m3u8|mpd)(?:$)/i.test(resourcePath) || /(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/i.test(resourcePath) ||
+              /[?&](?:format|type|mime|contenttype)=(?:[^&]*(?:m3u8|mpegurl|dash|mpd))/i.test(resourceUrl);
+            if (!manifestLike) continue;
+            var age = perfNow - (Number(performance.timeOrigin || 0) + Number(entry.startTime || 0));
+            if (age < -5000 || age > 180000) continue;
+            add(resourceUrl, {mime: /mpd/i.test(resourcePath) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'});
+          }
+        } catch (_) {}
         var nextData = window.__NEXT_DATA__;
         if (nextData && nextData.props && nextData.props.pageProps) {
           var pageProps = nextData.props.pageProps;
@@ -669,8 +697,21 @@ private const val SCAN_JS = """
       // currentSrc/src قد يتحولان مؤقتًا إلى ملف الإعلان؛ لا نضيفهما أثناء وضع الإعلان.
       // وإذا لم يكشف المشغل أي بديل وكان المصدر قصيرًا جدًا، نؤجّل اعتباره محتوى حتى يحدث انتقال.
       var currentSrc = absUrl(v.currentSrc || v.getAttribute('src') || '');
-      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(currentSrc);
       var currentDuration = Number(v.duration || 0);
+      var durationMismatchAd = flashvarsVideoDuration > 20 && currentDuration > 0 &&
+        currentDuration < flashvarsVideoDuration - Math.max(15, flashvarsVideoDuration * 0.15) &&
+        currentDuration / flashvarsVideoDuration < 0.80;
+      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(currentSrc) || flashvarsExplicitAd || durationMismatchAd;
+      v.__vbAdDetected = !!adNow;
+      v.__vbAdReason = hasAdMarker(v) || hasVisibleAdOverlay(v) ? 'ad-container' :
+        (isAdUrl(currentSrc) ? 'ad-url' : (flashvarsExplicitAd ? 'player-ad-flag' : (durationMismatchAd ? 'player-duration-mismatch' : '')));
+      v.__vbPlayerDuration = flashvarsVideoDuration;
+      if (adNow) {
+        out = out.filter(function(u){
+          var capture = sourceMeta[u] && sourceMeta[u].captureSource || '';
+          return capture !== 'player-flashvars' && capture !== 'performance-manifest';
+        });
+      }
       var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });
       // A short current item plus another source exposed by the same player is a strong
       // preroll signal: retain the alternative source(s), but do not add the ad currentSrc.
@@ -718,7 +759,7 @@ private const val SCAN_JS = """
           v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
         }
         var adContainer = hasAdMarker(v) || hasVisibleAdOverlay(v);
-        var ad = isAdUrl(src) || adContainer;
+        var ad = isAdUrl(src) || adContainer || v.__vbAdDetected === true;
         var wasAdState = v.__vbAdState;
         if (wasAdState === true && !ad) {
           // إعلان ما قبل التشغيل انتهى وبدأ المحتوى على عنصر الفيديو نفسه.
@@ -842,7 +883,7 @@ private const val SCAN_JS = """
       }
       // إذا تغير المصدر ولم يصل حدث DOM لأي سبب، أرسل تحديثًا من دورة الفحص.
       var sourceKey = src + '||' + sources.join('||');
-      var observedAdState = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v);
+      var observedAdState = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v) || v.__vbAdDetected === true;
       if (sourceKey !== v.__vbSourceKey || (v.__vbAdState !== undefined && v.__vbAdState !== observedAdState)) {
         emit(v, 'scan');
       } else if (v.__vbAdState === undefined) {
@@ -874,7 +915,7 @@ private const val SCAN_JS = """
     if (primaryVideo) {
       var pv = primaryVideo;
       var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
-      var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv);
+      var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv) || pv.__vbAdDetected === true;
       var pSources = collectSources(pv);
       var pKey = psrc + '||' + pSources.join('||');
       if (pKey !== pv.__vbSourceKey) emit(pv, 'scan');
@@ -887,6 +928,8 @@ private const val SCAN_JS = """
         playerConfigObjectCount: Number((pv.__vbFlashvarsStats || {}).objects || 0),
         playerMediaDefinitionCount: Number((pv.__vbFlashvarsStats || {}).definitions || 0),
         playerDefinitionQualities: (pv.__vbFlashvarsStats || {}).qualities || [],
+        playerVideoDuration: Number(pv.__vbPlayerDuration || 0),
+        adReason: String(pv.__vbAdReason || ''),
         suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
           (pSources.length === 0 || pSources.some(function(u){ return u !== psrc; })) && !pv.__vbContentTransition,
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
@@ -938,6 +981,8 @@ class MainActivity : AppCompatActivity() {
         var playerConfigObjectCount = 0
         var playerMediaDefinitionCount = 0
         var playerDefinitionQualities = ""
+        var playerVideoDurationSec = 0.0
+        var playerAdReason = ""
         // Cross-origin/frame player snapshots, held only in memory for the active page.
         val frameVideoStates = LinkedHashMap<String, String>()
         var primaryFrameOrigin = ""
@@ -1292,7 +1337,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateFab() {
         // لا عدادات أو شارات: الأحمر حصريًا عند رصد تشغيل فعلي بدأه المستخدم.
-        val active = cur?.activePlayback == true
+        val active = cur?.let { it.activePlayback && !it.primaryIsAd && !it.suspectedPreroll } == true
         (fabIcon.background as GradientDrawable).setColor(
             if (active) 0xFFE53935.toInt() else 0xFF78909C.toInt()
         )
@@ -1587,6 +1632,8 @@ class MainActivity : AppCompatActivity() {
                     .put("width", item.optInt("width", 0).coerceIn(0, 10000))
                     .put("height", item.optInt("height", 0).coerceIn(0, 10000))
                     .put("ad", item.optBoolean("ad", false) || isLikelyAdUrl(src))
+                    .put("adReason", item.optString("adReason").take(80))
+                    .put("playerVideoDuration", item.optDouble("playerVideoDuration", 0.0).coerceIn(0.0, 86400.0))
                     .put("gesture", item.optBoolean("gesture", false))
                     .put("sourceEpoch", item.optInt("sourceEpoch", 0).coerceAtLeast(0))
                     .put("cycle", item.optInt("cycle", 0).coerceAtLeast(0))
@@ -1643,7 +1690,13 @@ class MainActivity : AppCompatActivity() {
                         if (match != null) {
                             val playing = match.optBoolean("playing", false)
                             val gesture = match.optBoolean("gesture", false)
-                            val ad = match.optBoolean("ad", false) || t.primaryIsAd
+                            // The fresh frame snapshot is authoritative for this exact video.
+                            // Do not OR with the previous ad flag, otherwise a completed preroll
+                            // can keep the content permanently classified as an advertisement.
+                            val ad = match.optBoolean("ad", false) || isLikelyAdUrl(expectedSrc)
+                            t.playerVideoDurationSec = match.optDouble("playerVideoDuration", t.playerVideoDurationSec).takeIf { it.isFinite() && it in 0.0..86400.0 } ?: t.playerVideoDurationSec
+                            t.playerAdReason = match.optString("adReason").take(80)
+                            t.primaryIsAd = ad
                             val frameActive = FramePlaybackPolicy.shouldActivate(playing, gesture, ad, t.suspectedPreroll)
                             t.framePlaybackActiveId = if (frameActive) currentId else null
                             t.framePlaybackAt = System.currentTimeMillis()
@@ -1691,6 +1744,8 @@ class MainActivity : AppCompatActivity() {
         val sourceEpoch = item.optInt("sourceEpoch", 0)
         val cycle = item.optInt("cycle", 0)
         val isAd = item.optBoolean("ad", false)
+        t.playerVideoDurationSec = item.optDouble("playerVideoDuration", 0.0).takeIf { it.isFinite() && it in 0.0..86400.0 } ?: 0.0
+        t.playerAdReason = item.optString("adReason").take(80)
         val sourceKey = src + "||" + (item.optJSONArray("sources")?.let { arr ->
             (0 until arr.length()).joinToString("||") { arr.optString(it) }
         } ?: "")
@@ -1920,7 +1975,7 @@ class MainActivity : AppCompatActivity() {
                 // Player-declared rendition URLs may be opaque (no extension or quality query).
                 // Capture their safe request context too; rec() will retain it only when the
                 // URL is a real media candidate or matches a prepared player rendition.
-                if (!r.isForMainFrame && r.method.equals("GET", true) && isCandidatePlayerSource(u)) {
+                if (r.method.equals("GET", true) && isCandidatePlayerSource(u)) {
                     val captured = MediaCaptureCoordinator.snapshot(
                         url = u,
                         method = r.method,
@@ -2100,6 +2155,11 @@ class MainActivity : AppCompatActivity() {
         t.frameVideoMessageCount = 0
         t.frameReportedLightVideoCount = 0
         t.frameReportedShadowVideoCount = 0
+        t.playerConfigObjectCount = 0
+        t.playerMediaDefinitionCount = 0
+        t.playerDefinitionQualities = ""
+        t.playerVideoDurationSec = 0.0
+        t.playerAdReason = ""
         t.frameVideoStates.clear()
         t.primaryFrameOrigin = ""
         t.primaryFrameId = ""
@@ -2353,9 +2413,17 @@ class MainActivity : AppCompatActivity() {
                     item.requestHeaders, item.captureSource, item.codecHint, item.frameRateHint,
                     item.dynamicRangeHint, item.bandwidthHint, item.representationIdHint)
             } else item
-        }.sortedWith(compareBy<MediaItem> { if (it.origin == "dom" || it.origin == "dom-preroll") 0 else 1 }
-            .thenBy { if (it.type == "hls") 0 else 1 })
-            .take(48)
+        }.sortedWith(
+            compareBy<MediaItem> { when (it.captureSource) {
+                "performance-manifest" -> 0
+                "webview" -> 1
+                "fetch", "xhr", "service-worker" -> 2
+                "player-flashvars" -> 3
+                else -> 4
+            } }
+                .thenBy { if (it.type == "hls") 0 else 1 }
+                .thenBy { if (it.origin == "dom" || it.origin == "dom-preroll") 0 else 1 }
+        ).take(48)
         val headers = headersFor(t)
         t.lastResolveCandidateCount = items.size
         t.lastResolveReport = "بدأ تحليل ${items.size} مصدرًا..."
@@ -2757,6 +2825,8 @@ class MainActivity : AppCompatActivity() {
             val q = (0 until minOf(pageQualities.length(), 16)).map { pageQualities.optString(it).take(12) }.filter { it.isNotBlank() }.distinct()
             if (q.isNotEmpty()) t.playerDefinitionQualities = q.joinToString(", ")
         }
+        t.playerVideoDurationSec = p.optDouble("playerVideoDuration", 0.0).takeIf { it.isFinite() && it in 0.0..86400.0 } ?: 0.0
+        t.playerAdReason = p.optString("adReason").take(80)
         // مدة عنصر الفيديو القصيرة وغير المصنفة قد تكون مدة إعلان؛ لا نعتمدها كمدة الفيلم.
         if (!nowAd && !suspectedPreroll && duration.isFinite() && duration > 12.0) {
             t.expectedDurationSec = duration
@@ -2843,6 +2913,8 @@ class MainActivity : AppCompatActivity() {
             append("إعدادات مشغل مرصودة: ").append(t.playerConfigObjectCount)
                 .append(" / mediaDefinitions: ").append(t.playerMediaDefinitionCount)
             if (t.playerDefinitionQualities.isNotBlank()) append(" / الجودات: ").append(t.playerDefinitionQualities)
+            if (t.playerVideoDurationSec > 0.0) append(" / مدة المحتوى المعلنة: ").append(String.format(Locale.US, "%.0f ثانية", t.playerVideoDurationSec))
+            if (t.playerAdReason.isNotBlank()) append(" / إشارة الإعلان: ").append(t.playerAdReason)
             append("\n")
             append("جسر WebMessage Listener: ").append(if (t.frameBridgeRegistered) "مسجل" else "لم يسجل")
             if (t.frameBridgeError.isNotBlank()) append(" — ").append(t.frameBridgeError)
@@ -2852,8 +2924,10 @@ class MainActivity : AppCompatActivity() {
             append("Web Message Listener: ").append(if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) "مدعوم" else "غير مدعوم").append("\n")
             append("مصادر Resolver الحالية: ").append(t.media.size).append("\n")
             append("مصادر ضمن آخر محاولة تحليل: ").append(t.lastResolveCandidateCount).append("\n")
-            append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" })
-            if (t.lastResolveReport.isNotBlank()) append("\n\nتقرير التحليل:\n").append(t.lastResolveReport)
+            append("مصادر الالتقاط: ").append(if (kinds.isEmpty()) "لا توجد" else kinds.entries.joinToString { "${it.key}=${it.value}" }).append("\n")
+            append("قوائم HLS/DASH المرصودة من تحميل المشغل: ").append(t.preparedMedia.values.count { it.captureSource == "performance-manifest" }).append("\n")
+            append("روابط موقعة منتهية حسب validto/expires: ").append(t.preparedMedia.keys.count { MediaUrlExpiry.isExpired(it) }).append("\n")
+            if (t.lastResolveReport.isNotBlank()) append("\nتقرير التحليل:\n").append(t.lastResolveReport)
             append("\n\nالبيانات لا تتضمن روابط موقّعة أو Cookies أو Authorization.")
         }
         AlertDialog.Builder(this)
@@ -2870,6 +2944,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFabClick() {
         val t = cur ?: return
+        if (t.primaryIsAd || t.suspectedPreroll) {
+            showDiscoveryDiagnostics(t, "المشغل يعرض إعلانًا أو مصدرًا تمهيديًا؛ انتظر انتقاله إلى المحتوى ثم اضغط الزر مرة أخرى.")
+            return
+        }
         val videoId = t.primaryVideoId
         if (videoId == null || t.media.isEmpty()) {
             val message = when {

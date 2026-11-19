@@ -52,6 +52,7 @@ const window = {
   setInterval(fn) { window.__interval = fn; return 1; },
   VideoBrowserCapture: {postMessage(raw) { nativeMessages.push(JSON.parse(raw)); }},
   flashvars_987: {
+    video_duration: 420,
     mediaDefinitions: [
       {format:'hls', quality:1080, videoUrl:'https://cdn.example/content-1080.m3u8'},
       {format:'hls', quality:720, videoUrl:'https://cdn.example/content-720.m3u8'},
@@ -61,8 +62,20 @@ const window = {
   }
 };
 
+const performance = {
+  timeOrigin: Date.now() - 5000,
+  getEntriesByType(kind) {
+    if (kind !== 'resource') return [];
+    return [
+      {name:'https://cdn.example/active-from-player.m3u8', startTime:3000},
+      {name:'https://cdn.example/segment-001.m4s', startTime:3200},
+      {name:'https://ads.example/ad.m3u8', startTime:3100}
+    ];
+  }
+};
+
 const context = {
-  window, document, location: window.location, URL, Headers, TextDecoder,
+  window, document, location: window.location, URL, Headers, TextDecoder, performance,
   Promise, Uint8Array, Number, String, Object, Array, Date, RegExp, Math,
   getComputedStyle() { return {display:'block', visibility:'visible', opacity:'1'}; }
 };
@@ -74,7 +87,10 @@ if (state.frameOrigin !== childOrigin || !state.frameId) throw new Error('Frame 
 if (!Array.isArray(state.videos) || state.videos.length !== 1) throw new Error('Expected exactly one frame video snapshot');
 const selected = state.videos[0];
 if (!selected.playing || !selected.visible || selected.duration !== 420) throw new Error('Playback/visibility metadata missing');
+if (selected.playerVideoDuration !== 420) throw new Error('Declared content duration was not forwarded to native');
 if (!selected.sources.some(url => url.includes('master.m3u8'))) throw new Error('Current HLS source was not included');
+if (!selected.sources.some(url => url.includes('active-from-player.m3u8'))) throw new Error('Recent HLS manifest from Resource Timing was not included');
+if (selected.sources.some(url => url.includes('segment-001.m4s'))) throw new Error('A media segment was incorrectly exposed as a downloadable manifest');
 if (!selected.sources.some(url => url.includes('1080.m3u8'))) throw new Error('Alternative source was not included');
 // A tap inside the player should remain a user-initiated marker after the 12-second pointer window.
 (documentListeners.pointerdown || []).forEach(fn => fn({clientX:200, clientY:150}));
@@ -90,4 +106,21 @@ if (state.playerMediaDefinitionCount !== 4) throw new Error('mediaDefinitions co
 if (!state.playerDefinitionQualities.includes('1080p') || !state.playerDefinitionQualities.includes('720p') || state.playerDefinitionQualities.includes('360p')) throw new Error('flashvars quality diagnostics missing or includes an ad quality');
 if (JSON.stringify(state).includes('session=must-not-copy')) throw new Error('Frame document query leaked into snapshot');
 if (typeof window.__interval !== 'function') throw new Error('Frame state polling was not installed');
-console.log('Cross-origin iframe video capture passed: native-only frame identity, visibility/playback state, HLS and alternative sources, no page postMessage or page-query leakage');
+
+// A short in-player preroll is recognized against the content duration declared by flashvars.
+video.duration = 12;
+video.currentTime = 4;
+window.__interval();
+const adState = nativeMessages.filter(item => item.kind === 'frame-video-state').slice(-1)[0];
+if (!adState.videos[0].ad || adState.videos[0].adReason !== 'player-duration-mismatch') throw new Error('Preroll duration mismatch was not classified as an ad');
+if (adState.videos[0].playerVideoDuration !== 420) throw new Error('Content duration missing during preroll diagnostic');
+if (adState.videos[0].sources.some(url => url.includes('content-1080') || url.includes('active-from-player'))) throw new Error('Content renditions leaked while an ad was playing');
+
+// When the same player transitions to its declared content duration, renditions return.
+video.duration = 420;
+video.currentTime = 19;
+window.__interval();
+const contentState = nativeMessages.filter(item => item.kind === 'frame-video-state').slice(-1)[0];
+if (contentState.videos[0].ad) throw new Error('Content remained classified as an ad after duration transition');
+if (!contentState.videos[0].sources.some(url => url.includes('content-1080'))) throw new Error('Content renditions were not restored after preroll ended');
+console.log('Cross-origin iframe capture passed: rendition extraction, Resource Timing manifest recovery, preroll gating, content transition, and native-only frame messaging');

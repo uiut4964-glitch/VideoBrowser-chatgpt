@@ -106,3 +106,35 @@ object CaptureHeaders {
         return result
     }
 }
+
+
+/** Recognizes common signed-URL expiry parameters without exposing their values in diagnostics. */
+object MediaUrlExpiry {
+    private val expiryKeys = setOf("validto", "expires", "expiry", "expire", "exp", "token_exp")
+
+    fun expiresAtEpochSeconds(rawUrl: String): Long? {
+        return try {
+            val uri = java.net.URI(rawUrl)
+            val query = uri.rawQuery ?: return null
+            query.split('&').forEach { component ->
+                val parts = component.split('=', limit = 2)
+                if (parts.size != 2) return@forEach
+                val key = try { java.net.URLDecoder.decode(parts[0], "UTF-8") } catch (_: Exception) { parts[0] }
+                if (key.lowercase() !in expiryKeys) return@forEach
+                val value = try { java.net.URLDecoder.decode(parts[1], "UTF-8") } catch (_: Exception) { parts[1] }
+                val numeric = value.toLongOrNull()
+                if (numeric != null) {
+                    return if (numeric >= 1_000_000_000_000L) numeric / 1000L else numeric
+                }
+                val parsed = try { java.time.Instant.parse(value).epochSecond } catch (_: Exception) { null }
+                if (parsed != null) return parsed
+            }
+            null
+        } catch (_: Exception) { null }
+    }
+
+    fun isExpired(rawUrl: String, nowEpochSeconds: Long = System.currentTimeMillis() / 1000L, clockSkewSeconds: Long = 30L): Boolean {
+        val expires = expiresAtEpochSeconds(rawUrl) ?: return false
+        return expires < nowEpochSeconds - clockSkewSeconds
+    }
+}

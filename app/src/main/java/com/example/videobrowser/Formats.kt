@@ -270,6 +270,9 @@ object Formats {
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
         if (isAdUrl(item.url) || isPreviewUrl(item.url)) return out
+        if (MediaUrlExpiry.isExpired(item.url)) {
+            throw IOException("رابط الوسائط المؤقت منتهي الصلاحية (validto/expiry)؛ يلزم التقاط رابط جديد من المشغّل")
+        }
         val sourceHeaders = CaptureHeaders.merge(h, item.requestHeaders)
         val uriPath = try { java.net.URI(item.url).rawPath.orEmpty().lowercase(Locale.ROOT) } catch (_: Exception) { "" }
         val mimeHint = item.mimeHint.lowercase(Locale.ROOT)

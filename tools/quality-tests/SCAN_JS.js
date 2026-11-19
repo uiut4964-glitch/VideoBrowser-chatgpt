@@ -1,3 +1,4 @@
+
 (function(){
   try {
     var isHttp = function(u){ return /^https?:\/\//i.test(String(u || '')); };
@@ -205,6 +206,8 @@
       var flashvarsObjectCount = 0;
       var flashvarsDefinitionCount = 0;
       var flashvarsQualities = [];
+      var flashvarsVideoDuration = 0;
+      var flashvarsExplicitAd = false;
       var add = function(raw, meta){
         var u = absUrl(raw);
         if (!isHttp(u) || isAdUrl(u) || isPreviewUrl(u) || isChunkUrl(u) || !isPlayerMediaUrl(u, true)) return;
@@ -317,6 +320,13 @@
         for (var fi = 0; fi < flashvarsNames.length; fi++) {
           var flashvars = window[flashvarsNames[fi]];
           if (!flashvars || typeof flashvars !== 'object') continue;
+          var declaredDuration = Number(flashvars.video_duration || flashvars.videoDuration || flashvars.duration || 0);
+          if (Number.isFinite(declaredDuration) && declaredDuration > flashvarsVideoDuration && declaredDuration < 86400) flashvarsVideoDuration = declaredDuration;
+          var adFlagNames = ['isAdPlaying','adPlaying','adActive','isAd','prerollActive','isPreroll','adBreakActive'];
+          for (var af = 0; af < adFlagNames.length; af++) {
+            if (flashvars[adFlagNames[af]] === true || flashvars[adFlagNames[af]] === 1 ||
+                /^(playing|active|preroll)$/i.test(String(flashvars[adFlagNames[af]] || ''))) flashvarsExplicitAd = true;
+          }
           var definitions = flashvars.mediaDefinitions;
           if (!Array.isArray(definitions)) continue;
           flashvarsDefinitionCount += definitions.length;
@@ -344,6 +354,25 @@
             add(definitionUrl, definitionMeta);
           }
         }
+        // Blob/MSE players may fetch the active HLS/DASH manifest without exposing it as currentSrc.
+        // Read only recent manifest-like resource names; never inspect or copy media segment bodies.
+        try {
+          var perfEntries = performance && performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+          var perfNow = Date.now();
+          for (var pe = Math.max(0, perfEntries.length - 320); pe < perfEntries.length; pe++) {
+            var entry = perfEntries[pe];
+            var resourceUrl = String(entry && entry.name || '');
+            if (!isHttp(resourceUrl) || isAdUrl(resourceUrl) || isPreviewUrl(resourceUrl) || isChunkUrl(resourceUrl)) continue;
+            var resourcePath = '';
+            try { resourcePath = new URL(resourceUrl).pathname.toLowerCase(); } catch (_) {}
+            var manifestLike = /\.(m3u8|mpd)(?:$)/i.test(resourcePath) || /(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/i.test(resourcePath) ||
+              /[?&](?:format|type|mime|contenttype)=(?:[^&]*(?:m3u8|mpegurl|dash|mpd))/i.test(resourceUrl);
+            if (!manifestLike) continue;
+            var age = perfNow - (Number(performance.timeOrigin || 0) + Number(entry.startTime || 0));
+            if (age < -5000 || age > 180000) continue;
+            add(resourceUrl, {mime: /mpd/i.test(resourcePath) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'});
+          }
+        } catch (_) {}
         var nextData = window.__NEXT_DATA__;
         if (nextData && nextData.props && nextData.props.pageProps) {
           var pageProps = nextData.props.pageProps;
@@ -590,8 +619,21 @@
       // currentSrc/src قد يتحولان مؤقتًا إلى ملف الإعلان؛ لا نضيفهما أثناء وضع الإعلان.
       // وإذا لم يكشف المشغل أي بديل وكان المصدر قصيرًا جدًا، نؤجّل اعتباره محتوى حتى يحدث انتقال.
       var currentSrc = absUrl(v.currentSrc || v.getAttribute('src') || '');
-      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(currentSrc);
       var currentDuration = Number(v.duration || 0);
+      var durationMismatchAd = flashvarsVideoDuration > 20 && currentDuration > 0 &&
+        currentDuration < flashvarsVideoDuration - Math.max(15, flashvarsVideoDuration * 0.15) &&
+        currentDuration / flashvarsVideoDuration < 0.80;
+      var adNow = hasAdMarker(v) || hasVisibleAdOverlay(v) || isAdUrl(currentSrc) || flashvarsExplicitAd || durationMismatchAd;
+      v.__vbAdDetected = !!adNow;
+      v.__vbAdReason = hasAdMarker(v) || hasVisibleAdOverlay(v) ? 'ad-container' :
+        (isAdUrl(currentSrc) ? 'ad-url' : (flashvarsExplicitAd ? 'player-ad-flag' : (durationMismatchAd ? 'player-duration-mismatch' : '')));
+      v.__vbPlayerDuration = flashvarsVideoDuration;
+      if (adNow) {
+        out = out.filter(function(u){
+          var capture = sourceMeta[u] && sourceMeta[u].captureSource || '';
+          return capture !== 'player-flashvars' && capture !== 'performance-manifest';
+        });
+      }
       var hasAlternativeSource = out.some(function(u){ return u !== currentSrc; });
       // A short current item plus another source exposed by the same player is a strong
       // preroll signal: retain the alternative source(s), but do not add the ad currentSrc.
@@ -639,7 +681,7 @@
           v.__vbSourceEpoch = Number(v.__vbSourceEpoch || 0) + 1;
         }
         var adContainer = hasAdMarker(v) || hasVisibleAdOverlay(v);
-        var ad = isAdUrl(src) || adContainer;
+        var ad = isAdUrl(src) || adContainer || v.__vbAdDetected === true;
         var wasAdState = v.__vbAdState;
         if (wasAdState === true && !ad) {
           // إعلان ما قبل التشغيل انتهى وبدأ المحتوى على عنصر الفيديو نفسه.
@@ -763,7 +805,7 @@
       }
       // إذا تغير المصدر ولم يصل حدث DOM لأي سبب، أرسل تحديثًا من دورة الفحص.
       var sourceKey = src + '||' + sources.join('||');
-      var observedAdState = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v);
+      var observedAdState = isAdUrl(src) || hasAdMarker(v) || hasVisibleAdOverlay(v) || v.__vbAdDetected === true;
       if (sourceKey !== v.__vbSourceKey || (v.__vbAdState !== undefined && v.__vbAdState !== observedAdState)) {
         emit(v, 'scan');
       } else if (v.__vbAdState === undefined) {
@@ -795,7 +837,7 @@
     if (primaryVideo) {
       var pv = primaryVideo;
       var psrc = absUrl(pv.currentSrc || pv.getAttribute('src') || '');
-      var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv);
+      var pad = isAdUrl(psrc) || hasAdMarker(pv) || hasVisibleAdOverlay(pv) || pv.__vbAdDetected === true;
       var pSources = collectSources(pv);
       var pKey = psrc + '||' + pSources.join('||');
       if (pKey !== pv.__vbSourceKey) emit(pv, 'scan');
@@ -808,6 +850,8 @@
         playerConfigObjectCount: Number((pv.__vbFlashvarsStats || {}).objects || 0),
         playerMediaDefinitionCount: Number((pv.__vbFlashvarsStats || {}).definitions || 0),
         playerDefinitionQualities: (pv.__vbFlashvarsStats || {}).qualities || [],
+        playerVideoDuration: Number(pv.__vbPlayerDuration || 0),
+        adReason: String(pv.__vbAdReason || ''),
         suspectedPreroll: Number(pv.duration || 0) > 0 && Number(pv.duration || 0) <= 12 &&
           (pSources.length === 0 || pSources.some(function(u){ return u !== psrc; })) && !pv.__vbContentTransition,
         blob: /^blob:/i.test(String(pv.currentSrc || pv.src || ''))
